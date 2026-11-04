@@ -1,0 +1,32 @@
+services:
+  mosquitto:
+    image: eclipse-mosquitto:2
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:1883:1883"
+    volumes:
+      - ./mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+
+  # Міст станція -> MQTT. Перед запуском:
+  #   git clone https://github.com/VictorCV-DAM/oukitel-portable-bridge.git
+  #   і створи oukitel-portable-bridge/config.json (broker: "127.0.0.1")
+  bridge:
+    image: python:3.12-slim
+    restart: unless-stopped
+    working_dir: /app
+    volumes:
+      - ./oukitel-portable-bridge:/app
+    command: sh -c "pip install -q -r requirements.txt && python oukitel_cloud_mqtt.py"
+    depends_on: [mosquitto]
+    network_mode: host   # щоб міст бачив станцію в локальній мережі (LAN-режим)
+
+  bot:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      MQTT_HOST: localhost
+    volumes:
+      - ./data:/app/data
+    depends_on: [mosquitto]
+    network_mode: host
