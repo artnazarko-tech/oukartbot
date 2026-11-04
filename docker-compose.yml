@@ -28,5 +28,8 @@ services:
       MQTT_HOST: localhost
     volumes:
       - ./data:/app/data
+      # Журнал моста (лише читання): звідти бот бере справжню назву станції.
+      # Монтуємо один файл, а не теку: у теці лежить config.json з паролем від акаунта.
+      - ./oukitel-portable-bridge/oukitel_bridge.log:/bridge/oukitel_bridge.log:ro
     depends_on: [mosquitto]
     network_mode: host

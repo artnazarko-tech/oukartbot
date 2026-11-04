@@ -3,8 +3,10 @@
 import asyncio
 import json
 import os
+import re
 import sys
 import tempfile
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -58,7 +60,7 @@ def test_status_and_denied():
     bot.state_of("main").update(f"{bot.MQTT_TOPIC_BASE}/ac_input_watts", b"450", bot.MQTT_TOPIC_BASE)
     upd, ctx = make_update(1, "📊 Стан")
     run(bot.on_menu_text(upd, ctx))
-    assert "87%" in said(upd) and "Oukitel" in said(upd)
+    assert "87%" in said(upd) and "Мережа: ✅ є" in said(upd)
     upd, ctx = make_update(999, args=[])               # чужой
     run(bot.cmd_start(upd, ctx))
     assert "Доступ лише за запрошенням" in said(upd)
@@ -168,27 +170,39 @@ def test_bridge_name_and_index():
            "device": {"name": "Oukitel P2001", "model": "P2001 Plus", "serial_number": "AA:BB:01",
                       "connections": [["mac", "AA:BB:01"]]}}
     bot.handle_discovery(json.dumps(cfg).encode())
-    assert bot.state_of("main").meta["name"] == "Oukitel P2001"
-    assert S.device_name("main") == "Oukitel P2001" and S.devices()["main"]["serial"] == "AA:BB:01"
-    assert not bot.ADMIN_NOTICES
-    # інша станція (інший топік) не плутається
+    assert S.device_name("main") != "Oukitel P2001"                  # шаблонну назву з MQTT НЕ беремо
+    assert S.devices()["main"]["serial"] == "AA:BB:01" and bot.state_of("main").meta["model"] == "P2001 Plus"
     other = dict(cfg, state_topic="homeassistant/sensor/oukitel_mama/battery",
-                 device={"name": "Oukitel P5000", "serial_number": "CC:DD:02"})
+                 device={"name": "x", "serial_number": "CC:DD:02"})
     bot.handle_discovery(json.dumps(other).encode())
-    assert S.device_name("mama") == "Oukitel P5000" and S.device_name("main") == "Oukitel P2001"
-    # чужий топік і сміття ігноруються
-    bot.handle_discovery(json.dumps(dict(cfg, state_topic="other/topic")).encode())
+    assert S.devices()["mama"]["serial"] == "CC:DD:02" and S.device_name("mama") == "Мама 2 кВт"
+    bot.handle_discovery(json.dumps(dict(cfg, state_topic="other/topic")).encode())   # чужий топік
     bot.handle_discovery(b"not json")
+    # справжня назва — з журналу моста, код DK збігається з MAC
+    logf = TMP / "bridge.log"
+    logf.write_text("[19:30:00] start\n[19:32:18] 🔋 Power station detected: P1000PLUS/P1500PLUS_E9B3 "
+                    "(DK: aabb01, PK: p11uve, authKey: present)\n[19:36:00] ⚠️ Device offline\n", encoding="utf-8")
+    bot.BRIDGE_LOG_FILES = [str(logf), str(TMP / "немає.log"), str(TMP)]            # відсутній файл і тека не заважають
+    assert bot.read_bridge_names(bot.BRIDGE_LOG_FILES) == {"aabb01": "P1000PLUS/P1500PLUS_E9B3"}
+    run(bot.sync_bridge_names(None))
+    assert S.device_name("main") == "P1000PLUS/P1500PLUS_E9B3" and S.devices()["main"]["name_src"] == "log"
+    assert S.device_name("mama") == "Мама 2 кВт"                                    # у mama в журналі немає — без змін
+    # ручна назва сильніша за журнал; "-" повертає журнал
+    S.set_device_name("main", "Дім", "manual")
+    assert S.set_device_name("main", "P1000", "log") is False and S.device_name("main") == "Дім"
+    S.clear_manual_name("main")
+    run(bot.sync_bridge_names(None))
+    assert S.device_name("main") == "P1000PLUS/P1500PLUS_E9B3"
     # серійний змінився -> попередження адміну
-    swapped = dict(cfg, device={"name": "Oukitel P2001", "serial_number": "ZZ:99"})
+    swapped = dict(cfg, device={"serial_number": "ZZ:99"})
     bot.handle_discovery(json.dumps(swapped).encode())
     assert len(bot.ADMIN_NOTICES) == 1 and "AA:BB:01" in bot.ADMIN_NOTICES[0]
     app = MagicMock(); app.bot_data = {}; app.bot.send_message = AsyncMock()
     run(bot.check_alerts(SimpleNamespace(application=app)))
     assert not bot.ADMIN_NOTICES
     assert any(c[0][0] == 1 and "серійний" in c[0][1] for c in app.bot.send_message.call_args_list)
-    S.update_device_info("main", "Oukitel P2001", "AA:BB:01")
-    assert S.full_name("main") == "Oukitel P2001 №1"
+    S.update_serial("main", "AA:BB:01")
+    S.set_device_name("main", "Oukitel P2001", "manual")      # для наступних тестів
 
 
 def test_alias_duplicates_and_rename_flow():
@@ -222,6 +236,82 @@ def test_alias_duplicates_and_rename_flow():
     upd5, ctx5 = make_update(555, data="ren:nonexistent")
     run(bot.on_button(upd5, ctx5))
     assert "rename" not in ctx5.user_data
+
+
+def _buttons(kb):
+    return [b.callback_data for row in kb.inline_keyboard for b in row]
+
+
+def test_status_and_detail_format():
+    v = {"battery": 87, "temperature": 31, "input_watts": 450, "ac_input_watts": 450, "output_watts": 120,
+         "hardware_fault_status": "Normal", "availability": "online", "ac_charging_limit": 100,
+         "output_frequency": "50Hz", "ac_output_voltage": 230, "ac_switch": "ON", "dc_switch": "OFF",
+         "wifi_signal": -46, "bms_version": 206, "inverter_version": 106, "connection_mode": "Cloud",
+         "typec1_power": 0, "usb_a_power": 5, "dc_output_voltage": 0.0, "dc_output_current": 0.0}
+    t = bot.format_status(v, time.time(), "Дача")
+    lines = t.split("\n")
+    assert lines[0] == "⚡ <b>Дача</b>" and lines[1] == "Мережа: ✅ є"
+    assert "87%" in lines[2] and "31 °C" in lines[2]
+    assert "Вхід: <b>450 Вт</b>" in lines[3] and "Вихід: <b>120 Вт</b>" in lines[3]
+    assert "Помилки: ✅ немає" in t and re.search(r"Оновлено: \d\d\.\d\d\.\d{4} \d\d:\d\d", t)
+    bad = dict(v, ac_input_watts=0, input_watts=0, hardware_fault_status="Overload Protection", availability="offline")
+    t2 = bot.format_status(bad, time.time() - 1000, "Дача")
+    assert "Мережа: ❌ немає" in t2 and "Помилки: 1" in t2 and "⚠️ Спрацював захист" in t2
+    assert "не на зв'язку" in t2 and "застарілі" in t2
+    d = bot.format_detail(v, time.time(), "Дача")
+    assert "детальний стан" in d and "50 Гц" in d and "Ліміт зарядки з мережі: 100%" in d
+    assert "Wi-Fi: -46 дБм" in d and "BMS 206" in d and "Вихід AC: увімкнено" in d and "Потужність заряду батареї: +330 Вт" in d
+    assert not any(ch in d for ch in "✅❌⚠️🔋🌡⬇⬆")            # «суха» інформація без картинок
+    assert "ще немає" in bot.format_detail({}, 0, "Дача")
+
+
+def test_menu_navigation():
+    labels = [b.text for row in bot.menu_for(1).keyboard for b in row]
+    assert labels[:4] == ["📊 Стан", "🎛 Керування", "🔔 Сповіщення", "📈 Статистика"] and "👥 Користувачі" in labels
+    assert "👥 Користувачі" not in [b.text for row in bot.menu_for(555).keyboard for b in row]
+    for data, expect in (("m:main", "Головне меню"), ("m:control", "в розробці"), ("m:stats", "в розробці"),
+                         ("m:alerts", "Сповіщення"), ("sch:open", "Розклад звітів"), ("m:help", "Інструкція"),
+                         ("m:users", "Користувачі"), ("sd:main", "детальний стан"), ("st:main", "Мережа")):
+        upd, ctx = make_update(1, data=data)
+        run(bot.on_button(upd, ctx))
+        assert expect in edited(upd), data
+    # кнопки екрану «Стан»: оновити, назва, детальний, назад (до вибору станції — їх кілька), головне меню
+    kb = bot.status_view("main", 1)[1]
+    assert _buttons(kb) == ["st:main", "ren:main", "sd:main", "m:status", "m:main"]
+    assert _buttons(bot.detail_view("main", 1)[1]) == ["sd:main", "st:main", "m:main"]
+    assert "sch:open" in _buttons(bot.alerts_view(1)[1])
+    # доступ: чужа станція і розділ адміна
+    upd, ctx = make_update(555, data="m:users")
+    run(bot.on_button(upd, ctx))
+    upd.callback_query.answer.assert_called_with("⛔ Лише для адміна")
+    upd, ctx = make_update(555, data="sd:nonexistent")
+    run(bot.on_button(upd, ctx))
+    upd.callback_query.answer.assert_called_with("⛔ Немає доступу до цієї станції")
+    # кнопка меню знімає очікування назви
+    upd, ctx = make_update(1, "📈 Статистика")
+    ctx.user_data["rename"] = "main"
+    run(bot.on_menu_text(upd, ctx))
+    assert "rename" not in ctx.user_data and "в розробці" in said(upd)
+    # старе меню (версія 1) ще працює
+    upd, ctx = make_update(1, "⏰ Розклад")
+    run(bot.on_menu_text(upd, ctx))
+    assert "Розклад звітів" in said(upd)
+
+
+def test_devname_flow_admin_only():
+    upd, ctx = make_update(555, data="dn:dacha")
+    run(bot.on_button(upd, ctx))
+    assert "rename" not in ctx.user_data                         # не адмін
+    upd, ctx = make_update(1, data="dn:main")
+    run(bot.on_button(upd, ctx))
+    assert ctx.user_data["rename_scope"] == "official"
+    run(bot.on_text(make_update(1, "Дім")[0], ctx))
+    assert S.device_name("main") == "Дім" and S.devices()["main"]["name_src"] == "manual"
+    upd, ctx = make_update(1, data="dn:main")
+    run(bot.on_button(upd, ctx))
+    run(bot.on_text(make_update(1, "-")[0], ctx))
+    assert S.devices()["main"]["name_src"] is None
+    S.set_device_name("main", "Oukitel P2001", "manual")
 
 
 if __name__ == "__main__":

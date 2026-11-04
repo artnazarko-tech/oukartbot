@@ -16,10 +16,12 @@ Telegram-бот для моніторингу зарядної станції Ou
 ("світло зникло / з'явилося"), аварійні стани, відсутність даних.
 """
 
+import asyncio
 import html
 import json
 import logging
 import os
+import re
 import threading
 import time
 from datetime import datetime, time as dtime
@@ -59,7 +61,10 @@ STALE_AFTER_S = int(os.getenv("STALE_AFTER_S", "300"))
 DATA_FILE = Path(os.getenv("DATA_FILE", "data/schedules.json"))   # старий файл (версія 1), лише для міграції
 STORE_FILE = Path(os.getenv("STORE_FILE", "data/store.json"))
 DEFAULT_DEVICE_ID = "main"
-DEFAULT_DEVICE_NAME = os.getenv("DEVICE_NAME", "Oukitel P2001E Plus")
+DEFAULT_DEVICE_NAME = os.getenv("DEVICE_NAME", "Станція")   # тимчасова назва, поки справжню не знайдено
+# Журнал(и) моста: звідти береться справжня назва станції (міст пише її лише в лог, не в MQTT)
+BRIDGE_LOG_FILES = [p.strip() for p in os.getenv("BRIDGE_LOG_FILES", "/bridge/oukitel_bridge.log").split(",") if p.strip()]
+UI_VERSION = 2   # при зміні меню бот один раз надсилає всім нову клавіатуру
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
 log = logging.getLogger("oukitel-bot")
@@ -131,12 +136,13 @@ def parse_value(text: str):
 
 # Стан кожного пристрою окремо: {"main": StationState, ...}
 def parse_device_info(cfg: dict) -> dict[str, str]:
-    """З опису сенсора (Home Assistant discovery) дістає назву, модель і серійний номер станції."""
+    """З опису сенсора (Home Assistant discovery) дістає серійний номер станції.
+    Назва там шаблонна («Oukitel P2001»), тому її не беремо."""
     dev = cfg.get("device")
     if not isinstance(dev, dict):
         return {}
     info = {}
-    for field, key in (("name", "name"), ("model", "model"), ("serial", "serial_number")):
+    for field, key in (("model", "model"), ("serial", "serial_number")):
         val = dev.get(key)
         if isinstance(val, str) and val.strip():
             info[field] = val.strip()
@@ -145,6 +151,30 @@ def parse_device_info(cfg: dict) -> dict[str, str]:
             if isinstance(conn, list) and len(conn) == 2 and conn[0] == "mac":
                 info["serial"] = str(conn[1])
     return info
+
+
+LOG_NAME_RE = re.compile(r"Power station detected:\s*(.+?)\s*\(DK:\s*([0-9A-Fa-f:]+)")
+
+
+def read_bridge_names(paths: list[str], max_bytes: int = 8_000_000) -> dict[str, str]:
+    """Шукає в журналах моста рядки 'Power station detected: <назва> (DK: <код>...)'.
+    Повертає {код без двокрапок у нижньому регістрі: назва}. Код збігається з MAC (серійним номером) станції."""
+    names: dict[str, str] = {}
+    for path in paths:
+        try:
+            size = os.path.getsize(path)
+            with open(path, "rb") as f:
+                f.seek(max(0, size - max_bytes))
+                text = f.read().decode("utf-8", errors="replace")
+        except OSError:          # файлу немає, це тека тощо — просто пропускаємо
+            continue
+        for m in LOG_NAME_RE.finditer(text):
+            names[m.group(2).replace(":", "").lower()] = m.group(1).strip()
+    return names
+
+
+def serial_key(serial: str) -> str:
+    return serial.replace(":", "").lower()
 
 
 STATES: dict[str, StationState] = {}
@@ -183,58 +213,173 @@ def battery_icon(p: float) -> str:
     return "🔋" if p >= 30 else "🪫"
 
 
-def format_status(values: dict, updated: float, name: str = "Зарядна станція") -> str:
+FAULT_UA = {
+    "High Temperature Warning": "Висока температура (попередження)",
+    "Over-Temperature": "Перегрів",
+    "Under-Temperature": "Занадто низька температура",
+    "Low Battery Warning": "Низький заряд (попередження)",
+    "Critical Low Battery": "Критично низький заряд",
+    "Overload Protection": "Спрацював захист від перевантаження",
+    "Hardware Fault": "Апаратна несправність",
+}
+
+
+def fault_list(values: dict) -> list[str]:
+    """Список активних помилок станції (порожній, якщо все гаразд)."""
+    fault = values.get("hardware_fault_status")
+    if isinstance(fault, str) and fault.strip() and fault.strip().lower() != "normal":
+        return [FAULT_UA.get(fault.strip(), fault.strip())]
+    return []
+
+
+def grid_watts(values: dict) -> float | None:
+    w = num(values, "ac_input_watts", "ac_input_power")
+    return w if w is not None else num(values, "input_watts", "total_input_power")
+
+
+def grid_present(values: dict) -> bool | None:
+    """Є вхідне живлення з мережі? None — даних немає. (Прапорця «є мережа» міст не віддає, дивимось на потужність.)"""
+    w = grid_watts(values)
+    return None if w is None else w >= INPUT_ON_W
+
+
+def updated_line(updated: float) -> tuple[str, str]:
+    ts = datetime.fromtimestamp(updated, TZ).strftime("%d.%m.%Y %H:%M:%S")
+    stale = " (дані застарілі)" if time.time() - updated > STALE_AFTER_S else ""
+    return ts, stale
+
+
+def no_data(name: str) -> str:
+    return f"⚡ <b>{name}</b>\n⏳ Даних від станції ще немає. Спробуй за хвилину."
+
+
+def format_status(values: dict, updated: float, name: str = "Станція") -> str:
+    """Короткий стан: з картинками, для швидкого погляду."""
     if not updated:
-        return f"⚡ <b>{name}</b>\n⏳ Даних від станції ще немає. Спробуй за хвилину."
+        return no_data(name)
+    lines = [f"⚡ <b>{name}</b>"]
+
+    grid = grid_present(values)
+    if grid is not None:
+        lines.append("Мережа: ✅ є" if grid else "Мережа: ❌ немає")
 
     bat = num(values, "battery", "battery_level", "soc")
+    temp = num(values, "temperature", "temp")
+    parts = []
+    if bat is not None:
+        parts.append(f"{battery_icon(bat)} <b>{bat:.0f}%</b>")
+    if temp is not None:
+        parts.append(f"🌡 {temp:.0f} °C")
+    if parts:
+        lines.append("   ".join(parts))
+
     tin = num(values, "input_watts", "total_input_power", "input_power")
     tout = num(values, "output_watts", "total_output_power", "output_power")
-    ac_in = num(values, "ac_input_watts", "ac_input_power")
-    dc_in = num(values, "dc_input_watts", "dc_solar_input_power", "solar_input_watts")
-    ac_out = num(values, "ac_output_power")
-    dc_out = num(values, "dc_output_power")
-    temp = num(values, "temperature", "temp")
-    remain = num(values, "remain_time", "remaining_discharge_time")
-    charge_t = num(values, "remain_charging_time", "remaining_charge_time")
-    fault = values.get("hardware_fault_status")
+    lines.append(f"⬇️ Вхід: <b>{fmt_w(tin)}</b>   ⬆️ Вихід: <b>{fmt_w(tout)}</b>")
 
-    lines = [f"⚡ <b>{name}</b>"]
+    faults = fault_list(values)
+    if faults:
+        lines.append(f"Помилки: {len(faults)}")
+        lines += [f"⚠️ {f}" for f in faults]
+    else:
+        lines.append("Помилки: ✅ немає")
+
+    if str(values.get("availability", "online")).lower() == "offline":
+        lines.append("📴 Станція не на зв'язку (спить або без Wi-Fi), дані можуть бути старими")
+
+    ts, stale = updated_line(updated)
+    lines.append(f"\n🕐 Оновлено: {ts}{stale}")
+    return "\n".join(lines)
+
+
+def _txt(values: dict, key: str) -> str | None:
+    v = values.get(key)
+    return None if v is None or str(v).strip() in ("", "—") else str(v).strip()
+
+
+def _onoff(v: str | None) -> str | None:
+    return None if v is None else ("увімкнено" if v.upper() == "ON" else "вимкнено")
+
+
+def format_detail(values: dict, updated: float, name: str = "Станція") -> str:
+    """Детальний стан: суха інформація без картинок."""
+    if not updated:
+        return no_data(name)
+    L = [f"<b>{name}</b> — детальний стан", ""]
+
+    grid = grid_present(values)
+    if grid is not None:
+        L.append("Мережа: " + ("є" if grid else "немає"))
+    bat = num(values, "battery", "battery_level", "soc")
     if bat is not None:
-        lines.append(f"{battery_icon(bat)} Заряд: <b>{bat:.0f}%</b>")
+        L.append(f"Заряд батареї: {bat:.0f}%")
+    temp = num(values, "temperature", "temp")
+    if temp is not None:
+        L.append(f"Температура: {temp:.0f} °C")
 
+    tin = num(values, "input_watts", "total_input_power", "input_power")
+    tout = num(values, "output_watts", "total_output_power", "output_power")
+    ac_in, dc_in = num(values, "ac_input_watts", "ac_input_power"), num(values, "dc_input_watts", "dc_solar_input_power")
+    L.append("")
+    L.append(f"Вхід: {fmt_w(tin)}" + (f" (мережа {fmt_w(ac_in)}, сонце/DC {fmt_w(dc_in)})" if ac_in is not None or dc_in is not None else ""))
+    ac_out, dc_out = num(values, "ac_output_power"), num(values, "dc_output_power")
+    L.append(f"Вихід: {fmt_w(tout)}" + (f" (AC {fmt_w(ac_out)}, DC 12 В {fmt_w(dc_out)})" if ac_out is not None or dc_out is not None else ""))
     if tin is not None and tout is not None:
         net = tin - tout
-        if net > 5:
-            lines.append(f"📈 Заряджається (+{net:.0f} Вт)")
-        elif net < -5:
-            lines.append(f"📉 Розряджається ({net:.0f} Вт)")
-        else:
-            lines.append("⏸ Баланс ~0")
+        L.append(f"Потужність заряду батареї: {net:+.0f} Вт " + ("(заряджається)" if net > 5 else "(розряджається)" if net < -5 else "(баланс)"))
+    limit = num(values, "ac_charging_limit")
+    if limit is not None:
+        L.append(f"Ліміт зарядки з мережі: {limit:.0f}%")
 
-    lines.append("")
-    lines.append(f"⬇️ Вхід: <b>{fmt_w(tin)}</b>")
-    if ac_in is not None or dc_in is not None:
-        lines.append(f"   🔌 Мережа: {fmt_w(ac_in)}   ☀️ Сонце: {fmt_w(dc_in)}")
-    lines.append(f"⬆️ Вихід: <b>{fmt_w(tout)}</b>")
-    if ac_out is not None or dc_out is not None:
-        lines.append(f"   🔌 AC: {fmt_w(ac_out)}   🚗 DC 12В: {fmt_w(dc_out)}")
+    L.append("")
+    ac_v, freq, set_v = num(values, "ac_output_voltage"), _txt(values, "output_frequency"), _txt(values, "output_voltage")
+    out_bits = []
+    if ac_v is not None:
+        out_bits.append(f"{ac_v:.0f} В")
+    if freq:
+        out_bits.append(freq.replace("Hz", " Гц"))
+    if out_bits:
+        L.append("Вихід AC зараз: " + ", ".join(out_bits))
+    if set_v:
+        L.append("Задана напруга виходу: " + set_v.replace("V", " В"))
+    for label, key in (("Вихід AC", "ac_switch"), ("Вихід DC 12 В", "dc_switch"), ("USB", "usb_switch")):
+        state = _onoff(_txt(values, key))
+        if state:
+            L.append(f"{label}: {state}")
+    dv, da = num(values, "dc_output_voltage"), num(values, "dc_output_current")
+    if dv is not None and da is not None:
+        L.append(f"DC 12 В: {dv:.1f} В, {da:.1f} А")
 
+    ports = [(f"Type-C {i}", num(values, f"typec{i}_power")) for i in range(1, 5)]
+    ports += [("USB-A", num(values, "usb_a_power")), ("USB-C QC", num(values, "usb_c_qc_power"))]
+    ports = [(n, p) for n, p in ports if p is not None]
+    if ports:
+        L.append("Порти: " + ", ".join(f"{n} {p:.0f} Вт" for n, p in ports))
+
+    remain, charge_t = num(values, "remain_time", "remaining_discharge_time"), num(values, "remain_charging_time", "remaining_charge_time")
     if tin is not None and tout is not None and tout > tin and remain:
-        lines.append(f"\n⏱ Вистачить на: {fmt_minutes(remain)}")
+        L.append(f"Вистачить на: {fmt_minutes(remain)}")
     elif charge_t:
-        lines.append(f"\n⏱ До повного заряду: {fmt_minutes(charge_t)}")
+        L.append(f"До повного заряду: {fmt_minutes(charge_t)}")
 
-    if temp is not None:
-        lines.append(f"🌡 Температура: {temp:.0f} °C")
-    if isinstance(fault, str) and fault and fault.lower() != "normal":
-        lines.append(f"⚠️ Стан: <b>{fault}</b>")
+    L.append("")
+    wifi, mode = num(values, "wifi_signal"), _txt(values, "connection_mode")
+    if wifi is not None:
+        L.append(f"Wi-Fi: {wifi:.0f} дБм")
+    if mode:
+        L.append(f"Підключення до станції: {mode}")
+    ver = [f"{n} {_txt(values, k)}" for n, k in (("BMS", "bms_version"), ("інвертор", "inverter_version")) if _txt(values, k)]
+    if ver:
+        L.append("Версії: " + ", ".join(ver))
+    avail = _txt(values, "availability")
+    if avail:
+        L.append("Зв'язок станції з хмарою: " + ("є" if avail.lower() == "online" else "немає"))
 
-    age = time.time() - updated
-    ts = datetime.fromtimestamp(updated, TZ).strftime("%H:%M:%S")
-    stale = " ⚠️ дані застарілі" if age > STALE_AFTER_S else ""
-    lines.append(f"\n<i>Оновлено о {ts}{stale}</i>")
-    return "\n".join(lines)
+    faults = fault_list(values)
+    L.append("Помилки: " + ("; ".join(faults) if faults else "немає"))
+    ts, stale = updated_line(updated)
+    L.append(f"\nОновлено: {ts}{stale}")
+    return "\n".join(L)
 
 
 # ---------------------------------------------------------------- допоміжне
@@ -248,6 +393,11 @@ def esc(text: object) -> str:
 def status_text(dev_id: str, chat_id: int) -> str:
     values, updated = state_of(dev_id).snapshot()
     return format_status(values, updated, esc(STORE.label(chat_id, dev_id)))
+
+
+def detail_text(dev_id: str, chat_id: int) -> str:
+    values, updated = state_of(dev_id).snapshot()
+    return format_detail(values, updated, esc(STORE.label(chat_id, dev_id)))
 
 
 def role_summary(chat_id: int, full: bool = False) -> str:
@@ -295,12 +445,17 @@ def is_admin(update: Update) -> bool:
     return STORE.is_admin(update.effective_chat.id)
 
 
-# ---------------------------------------------------------------- кнопки (константи)
+# ---------------------------------------------------------------- кнопки та екрани
 BTN_STATUS = "📊 Стан"
-BTN_SCHEDULE = "⏰ Розклад"
+BTN_CONTROL = "🎛 Керування"
 BTN_ALERTS = "🔔 Сповіщення"
+BTN_STATS = "📈 Статистика"
 BTN_HELP = "ℹ️ Допомога"
 BTN_USERS = "👥 Користувачі"
+BTN_SCHEDULE = "⏰ Розклад"      # стара кнопка (версія 1): лишаємо, щоб не зламати старе меню у людей
+
+View = tuple[str, "InlineKeyboardMarkup | None"]
+HOME = B("🏠 Головне меню", callback_data="m:main")
 
 
 def menu_for(chat_id: int) -> ReplyKeyboardMarkup:
@@ -309,14 +464,75 @@ def menu_for(chat_id: int) -> ReplyKeyboardMarkup:
     if STORE.is_admin(chat_id):
         last.append(KeyboardButton(BTN_USERS))
     return ReplyKeyboardMarkup(
-        [[KeyboardButton(BTN_STATUS)], [KeyboardButton(BTN_SCHEDULE), KeyboardButton(BTN_ALERTS)], last],
+        [[KeyboardButton(BTN_STATUS), KeyboardButton(BTN_CONTROL)],
+         [KeyboardButton(BTN_ALERTS), KeyboardButton(BTN_STATS)], last],
         resize_keyboard=True, is_persistent=True,
     )
 
 
-def status_kb(dev_id: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[B("🔄 Оновити", callback_data=f"status:refresh:{dev_id}"),
-                                  B("✏️ Назва", callback_data=f"ren:{dev_id}")]])
+def main_menu_view(chat_id: int) -> View:
+    rows = [[B(BTN_STATUS, callback_data="m:status"), B(BTN_CONTROL, callback_data="m:control")],
+            [B(BTN_ALERTS, callback_data="m:alerts"), B(BTN_STATS, callback_data="m:stats")],
+            [B(BTN_HELP, callback_data="m:help")]]
+    if STORE.is_admin(chat_id):
+        rows[-1].append(B(BTN_USERS, callback_data="m:users"))
+    return "🏠 <b>Головне меню</b>\nОбери розділ:", InlineKeyboardMarkup(rows)
+
+
+def status_entry_view(chat_id: int) -> View:
+    """«Стан»: одна станція — одразу її стан, кілька — спочатку вибір."""
+    devs = STORE.devices_for(chat_id)
+    if not devs:
+        return "У тебе поки немає доступу до жодної станції. Попроси адміна.", InlineKeyboardMarkup([[HOME]])
+    if len(devs) == 1:
+        return status_view(devs[0], chat_id)
+    rows = [[B(STORE.label(chat_id, d), callback_data=f"st:{d}")] for d in devs] + [[HOME]]
+    return "Яка станція?", InlineKeyboardMarkup(rows)
+
+
+def status_view(dev_id: str, chat_id: int) -> View:
+    back = "m:status" if len(STORE.devices_for(chat_id)) > 1 else "m:main"
+    kb = InlineKeyboardMarkup([
+        [B("🔄 Оновити", callback_data=f"st:{dev_id}"), B("✏️ Назва", callback_data=f"ren:{dev_id}")],
+        [B("📋 Детальний стан", callback_data=f"sd:{dev_id}")],
+        [B("⬅️ Назад", callback_data=back), HOME],
+    ])
+    return status_text(dev_id, chat_id), kb
+
+
+def detail_view(dev_id: str, chat_id: int) -> View:
+    kb = InlineKeyboardMarkup([
+        [B("🔄 Оновити", callback_data=f"sd:{dev_id}")],
+        [B("⬅️ Назад", callback_data=f"st:{dev_id}"), HOME],
+    ])
+    return detail_text(dev_id, chat_id), kb
+
+
+def alerts_view(chat_id: int) -> View:
+    text = (
+        "🔔 <b>Сповіщення</b>\n\n"
+        "Поки бот автоматично пише всім, хто має доступ до станції:\n"
+        f"• заряд нижче {LOW_BATTERY:.0f}% і заряд {FULL_BATTERY:.0f}%\n"
+        "• світло з'явилося / зникло (за вхідною потужністю з мережі)\n"
+        "• помилки станції\n"
+        f"• немає даних довше {STALE_AFTER_S // 60} хв\n\n"
+        "Окремі налаштування для кожної людини — скоро."
+    )
+    return text, InlineKeyboardMarkup([[B("⏰ Розклад звітів", callback_data="sch:open")], [HOME]])
+
+
+def soon_view(title: str) -> View:
+    return f"{title}\n\n🚧 Цей розділ ще в розробці. Скоро буде!", InlineKeyboardMarkup([[HOME]])
+
+
+def schedule_view(chat_id: int) -> View:
+    cfg = STORE.schedule(chat_id)
+    return schedule_text(cfg), schedule_kb(cfg)
+
+
+async def reply_view(update: Update, view: View) -> None:
+    text, kb = view
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=kb)
 
 
 PRESET_TIMES = ["07:00", "09:00", "12:00", "15:00", "18:00", "21:00", "23:00"]
@@ -360,42 +576,38 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 HELP_COMMON = (
     "📖 <b>Інструкція</b>\n\n"
-    "📊 <b>Стан</b> — поточні показники станції: заряд, вхід і вихід у Вт, "
-    "скільки ще пропрацює або скільки до повного заряду. Кнопка «🔄 Оновити» бере свіжі дані.\n\n"
+    "📊 <b>Стан</b> — головні показники станції: чи є світло, заряд, температура, вхід і вихід у Вт, помилки. "
+    "Кнопка «📋 Детальний стан» показує докладніше: частоту, порти, версії тощо. «🔄 Оновити» бере свіжі дані.\n\n"
     "✏️ <b>Назва</b> — кнопка під станом (або /rename). Можна назвати станцію зручно, наприклад «Дача». "
     "Нову назву бачиш тільки ти.\n\n"
-    "⏰ <b>Розклад</b> — бот сам надсилатиме стан у потрібний час або кожні кілька хвилин. "
-    "Натискай на час, щоб увімкнути чи вимкнути його. Свій час: /schedule 08:30\n\n"
     "🔔 <b>Сповіщення</b> — що бот пише сам: світло з'явилося чи зникло, низький і повний заряд, "
-    "помилки станції, немає зв'язку."
+    "помилки станції, немає зв'язку. Там же «⏰ Розклад звітів»: бот сам надсилатиме стан у потрібний час "
+    "або кожні кілька хвилин (свій час: /schedule 08:30).\n\n"
+    "🎛 <b>Керування</b> і 📈 <b>Статистика</b> — скоро."
 )
 HELP_ADMIN = (
     "\n\n👥 <b>Користувачі</b> — хто має доступ і до яких станцій; тут можна змінити роль чи видалити людину.\n\n"
     "➕ /invite — запросити людину: обираєш роль і станції та отримуєш посилання.\n"
     "• <b>Власник</b> — керує обраними станціями.\n"
-    "• <b>Гість</b> — лише дивиться."
+    "• <b>Гість</b> — лише дивиться.\n\n"
+    "🏷 /devname — офіційна назва станції (однакова для всіх; зазвичай бот бере її сам)."
 )
+
+
+def help_view(chat_id: int) -> View:
+    return HELP_COMMON + (HELP_ADMIN if STORE.is_admin(chat_id) else ""), InlineKeyboardMarkup([[HOME]])
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not allowed(update):
         return
-    text = HELP_COMMON + (HELP_ADMIN if is_admin(update) else "")
-    await update.message.reply_text(text, parse_mode="HTML")
+    await reply_view(update, help_view(update.effective_chat.id))
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not allowed(update):
         return
-    devs = STORE.devices_for(update.effective_chat.id)
-    if not devs:
-        await update.message.reply_text("У тебе поки немає доступу до жодної станції. Попроси адміна.")
-    elif len(devs) == 1:
-        await update.message.reply_text(status_text(devs[0], update.effective_chat.id), parse_mode="HTML",
-                                        reply_markup=status_kb(devs[0]))
-    else:
-        await update.message.reply_text("Яка станція?", reply_markup=InlineKeyboardMarkup(
-            [[B(STORE.label(update.effective_chat.id, d), callback_data=f"dev:status:{d}")] for d in devs]))
+    await reply_view(update, status_entry_view(update.effective_chat.id))
 
 
 async def cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -469,15 +681,7 @@ async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not allowed(update):
         return
-    await update.message.reply_text(
-        "🔔 Автоматичні сповіщення:\n"
-        f"• заряд нижче {LOW_BATTERY:.0f}%\n"
-        f"• заряд досяг {FULL_BATTERY:.0f}%\n"
-        f"• зникло / з'явилося живлення з мережі (поріг {INPUT_ON_W:.0f} Вт, затримка {INPUT_DEBOUNCE_S} с)\n"
-        "• аварійні стани станції\n"
-        f"• немає даних довше {STALE_AFTER_S // 60} хв\n\n"
-        "Пороги змінюються у файлі .env"
-    )
+    await reply_view(update, alerts_view(update.effective_chat.id))
 
 
 async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -487,9 +691,9 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     for dev_id, info in STORE.devices().items():
         base = info["topic_base"]
         raw = state_of(dev_id).raw_snapshot()
-        bridge = state_of(dev_id).meta.get("name", "не отримано")
         meta = state_of(dev_id).meta
-        head = (f"[{STORE.full_name(dev_id)}] id={dev_id}, назва від моста: {bridge}, "
+        src = {"log": "з журналу моста", "manual": "задана адміном"}.get(info.get("name_src"), "тимчасова")
+        head = (f"[{STORE.full_name(dev_id)}] id={dev_id}, назва: {src}, "
                 f"модель: {meta.get('model', '—')}, серійний: {meta.get('serial', '—')}")
         if not raw:
             chunks.append(f"{head}\nMQTT-повідомлень не отримано.\nБрокер: {MQTT_HOST}:{MQTT_PORT}\nТопік: {base}/#")
@@ -501,8 +705,13 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(text[i:i + 3800])
 
 
-# ---------------------------------------------------------------- особиста назва станції
-def rename_prompt(chat_id: int, dev_id: str) -> str:
+# ---------------------------------------------------------------- назви станцій
+def rename_prompt(chat_id: int, dev_id: str, official: bool = False) -> str:
+    if official:
+        return (
+            f"🏷 Офіційна назва станції <b>{esc(STORE.device_name(dev_id))}</b> (її бачать усі, у кого немає власної).\n\n"
+            "Напиши нову назву (до 40 символів). Щоб знову брати її з журналу моста — надішли «-»."
+        )
     return (
         f"✏️ Як називати станцію <b>{esc(STORE.device_name(dev_id))}</b>?\n\n"
         "Напиши нову назву (до 40 символів). Її бачитимеш тільки ти.\n"
@@ -510,19 +719,39 @@ def rename_prompt(chat_id: int, dev_id: str) -> str:
     )
 
 
-async def cmd_rename(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not allowed(update):
-        return
+def start_rename(context: ContextTypes.DEFAULT_TYPE, dev_id: str, official: bool) -> None:
+    context.user_data["rename"] = dev_id
+    context.user_data["rename_scope"] = "official" if official else "personal"
+
+
+def stop_rename(context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.pop("rename", None)
+    context.user_data.pop("rename_scope", None)
+
+
+async def _rename_command(update: Update, context: ContextTypes.DEFAULT_TYPE, official: bool) -> None:
     chat_id = update.effective_chat.id
     devs = STORE.devices_for(chat_id)
+    prefix = "dn" if official else "ren"
     if not devs:
         await update.message.reply_text("У тебе поки немає доступу до жодної станції.")
     elif len(devs) == 1:
-        context.user_data["rename"] = devs[0]
-        await update.message.reply_text(rename_prompt(chat_id, devs[0]), parse_mode="HTML")
+        start_rename(context, devs[0], official)
+        await update.message.reply_text(rename_prompt(chat_id, devs[0], official), parse_mode="HTML")
     else:
         await update.message.reply_text("Яку станцію назвати?", reply_markup=InlineKeyboardMarkup(
-            [[B(STORE.label(chat_id, d), callback_data=f"ren:{d}")] for d in devs]))
+            [[B(STORE.label(chat_id, d) if not official else STORE.full_name(d), callback_data=f"{prefix}:{d}")]
+             for d in devs]))
+
+
+async def cmd_rename(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if allowed(update):
+        await _rename_command(update, context, official=False)
+
+
+async def cmd_devname(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if allowed(update) and is_admin(update):
+        await _rename_command(update, context, official=True)
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -532,22 +761,43 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     dev_id = context.user_data.get("rename")
     if not dev_id:
         return
+    official = context.user_data.get("rename_scope") == "official"
     chat_id = update.effective_chat.id
-    if not STORE.role(chat_id, dev_id):
-        context.user_data.pop("rename", None)
+    if not STORE.role(chat_id, dev_id) or (official and not is_admin(update)):
+        stop_rename(context)
         return
     text = " ".join((update.message.text or "").split())   # прибираємо переноси й зайві пробіли
     if text in ("-", "—"):
-        STORE.set_alias(chat_id, dev_id, None)
-        reply = f"↩️ Повернув стандартну назву: <b>{esc(STORE.label(chat_id, dev_id))}</b>"
+        if official:
+            STORE.clear_manual_name(dev_id)
+            reply = "↩️ Добре, далі братиму назву з журналу моста (протягом кількох хвилин)."
+        else:
+            STORE.set_alias(chat_id, dev_id, None)
+            reply = f"↩️ Повернув стандартну назву: <b>{esc(STORE.label(chat_id, dev_id))}</b>"
     elif 0 < len(text) <= 40:
-        STORE.set_alias(chat_id, dev_id, text)
-        reply = f"✅ Готово! Тепер станція називається <b>{esc(text)}</b>."
+        if official:
+            STORE.set_device_name(dev_id, text, "manual")
+            reply = f"✅ Готово! Офіційна назва: <b>{esc(text)}</b>."
+        else:
+            STORE.set_alias(chat_id, dev_id, text)
+            reply = f"✅ Готово! Тепер станція називається <b>{esc(text)}</b>."
     else:
         await update.message.reply_text("Назва має бути від 1 до 40 символів. Спробуй ще раз або надішли «-».")
         return
-    context.user_data.pop("rename", None)
+    stop_rename(context)
     await update.message.reply_text(reply, parse_mode="HTML")
+
+
+async def sync_bridge_names(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Підтягує справжні назви станцій із журналу моста (для станцій, у яких назву ще не знайшли/не задали)."""
+    pending = {d: serial_key(i["serial"]) for d, i in STORE.devices().items()
+               if i.get("serial") and i.get("name_src") is None}
+    if not pending:
+        return
+    names = await asyncio.to_thread(read_bridge_names, BRIDGE_LOG_FILES)
+    for dev_id, key in pending.items():
+        if key in names and STORE.set_device_name(dev_id, names[key], "log"):
+            log.info("Назва станції %s з журналу моста: %s", dev_id, names[key])
 
 
 # ---------------------------------------------------------------- запрошення та користувачі (адмін)
@@ -589,6 +839,7 @@ def users_view() -> tuple[str, InlineKeyboardMarkup]:
         lines.append(f"• {esc(title)} — {role_summary(cid, full=True)}")
         rows.append([B(f"👤 {title}", callback_data=f"usr:open:{cid}")])
     lines.append("\nНатисни на людину, щоб змінити доступ. Нових людей додає /invite.")
+    rows.append([HOME])
     return "\n".join(lines), InlineKeyboardMarkup(rows)
 
 
@@ -648,32 +899,34 @@ def schedule_kb(cfg: dict) -> InlineKeyboardMarkup:
         for m, label in PRESET_INTERVALS
     ])
     rows.append([B("🗑 Очистити все", callback_data="sch:clear")])
+    rows.append([B("⬅️ Назад", callback_data="m:alerts"), HOME])
     return InlineKeyboardMarkup(rows)
-
-
-async def show_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not allowed(update):
-        return
-    cfg = STORE.schedule(update.effective_chat.id)
-    await update.message.reply_text(schedule_text(cfg), parse_mode="HTML", reply_markup=schedule_kb(cfg))
 
 
 async def on_menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обробка натискань на кнопки нижнього меню."""
     if not allowed(update):
         return
+    chat_id = update.effective_chat.id
+    stop_rename(context)      # натиснув кнопку меню — вводити назву вже не чекаємо
     text = update.message.text
-    context.user_data.pop("rename", None)      # натиснув кнопку меню — вводити назву вже не чекаємо
     if text == BTN_STATUS:
-        await cmd_status(update, context)
-    elif text == BTN_SCHEDULE:
-        await show_schedule(update, context)
+        view = status_entry_view(chat_id)
+    elif text == BTN_CONTROL:
+        view = soon_view("🎛 <b>Керування</b>")
     elif text == BTN_ALERTS:
-        await cmd_alerts(update, context)
+        view = alerts_view(chat_id)
+    elif text == BTN_STATS:
+        view = soon_view("📈 <b>Статистика</b>")
     elif text == BTN_HELP:
-        await cmd_help(update, context)
-    elif text == BTN_USERS:
-        await cmd_users(update, context)
+        view = help_view(chat_id)
+    elif text == BTN_SCHEDULE:
+        view = schedule_view(chat_id)
+    elif text == BTN_USERS and is_admin(update):
+        view = users_view()
+    else:
+        return
+    await reply_view(update, view)
 
 
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -687,26 +940,50 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     app = context.application
 
     try:
-        # --- стан станції
-        if data.startswith(("status:refresh:", "dev:status:")):
-            dev_id = data.split(":", 2)[2]
-            if not STORE.role(chat_id, dev_id):
-                await query.answer("⛔ Немає доступу до цієї станції")
+        # --- головне меню та розділи
+        if data.startswith("m:"):
+            name = data[2:]
+            if name == "users" and not is_admin(update):
+                await query.answer("⛔ Лише для адміна")
                 return
-            await query.answer("Оновлено")
-            await query.edit_message_text(status_text(dev_id, chat_id), parse_mode="HTML",
-                                          reply_markup=status_kb(dev_id))
+            views = {
+                "main": lambda: main_menu_view(chat_id),
+                "status": lambda: status_entry_view(chat_id),
+                "control": lambda: soon_view("🎛 <b>Керування</b>"),
+                "alerts": lambda: alerts_view(chat_id),
+                "stats": lambda: soon_view("📈 <b>Статистика</b>"),
+                "help": lambda: help_view(chat_id),
+                "users": users_view,
+            }
+            if name not in views:
+                await query.answer()
+                return
+            text, kb = views[name]()
+            await query.answer()
+            await query.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
             return
 
-        # --- особиста назва станції
-        if data.startswith("ren:"):
-            dev_id = data.split(":", 1)[1]
+        # --- стан станції (st: — короткий, sd: — детальний; status:refresh:/dev:status: — старі кнопки)
+        if data.startswith(("st:", "sd:", "status:refresh:", "dev:status:")):
+            dev_id = data.split(":")[-1]
             if not STORE.role(chat_id, dev_id):
                 await query.answer("⛔ Немає доступу до цієї станції")
                 return
-            context.user_data["rename"] = dev_id
+            text, kb = detail_view(dev_id, chat_id) if data.startswith("sd:") else status_view(dev_id, chat_id)
+            await query.answer("Оновлено")
+            await query.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
+            return
+
+        # --- назва станції: ren: — особиста, dn: — офіційна (лише адмін)
+        if data.startswith(("ren:", "dn:")):
+            official = data.startswith("dn:")
+            dev_id = data.split(":", 1)[1]
+            if not STORE.role(chat_id, dev_id) or (official and not is_admin(update)):
+                await query.answer("⛔ Немає доступу до цієї станції")
+                return
+            start_rename(context, dev_id, official)
             await query.answer()
-            await query.message.reply_text(rename_prompt(chat_id, dev_id), parse_mode="HTML")
+            await query.message.reply_text(rename_prompt(chat_id, dev_id, official), parse_mode="HTML")
             return
 
         # --- розклад
@@ -725,6 +1002,8 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             elif kind == "clear":
                 cfg["times"], cfg["interval_min"] = [], 0
                 await query.answer("Розклад очищено")
+            elif kind == "open":
+                await query.answer()
             STORE.save()
             register_jobs(app, chat_id, cfg)
             await query.edit_message_text(schedule_text(cfg), parse_mode="HTML", reply_markup=schedule_kb(cfg))
@@ -922,14 +1201,12 @@ def handle_discovery(payload: bytes) -> None:
         return
     dev_id = found[0]
     state_of(dev_id).meta.update(info)
-    res = STORE.update_device_info(dev_id, info.get("name"), info.get("serial"))
-    if res["name_changed"]:
-        log.info("Назва станції %s від моста: %s", dev_id, info.get("name"))
-    if res["old_serial"]:
-        log.warning("Серійний номер станції %s змінився: %s -> %s", dev_id, res["old_serial"], info.get("serial"))
+    old_serial = STORE.update_serial(dev_id, info.get("serial"))
+    if old_serial:
+        log.warning("Серійний номер станції %s змінився: %s -> %s", dev_id, old_serial, info.get("serial"))
         ADMIN_NOTICES.append(
             f"⚠️ Станція <b>{esc(STORE.full_name(dev_id))}</b> тепер повідомляє інший серійний номер "
-            f"(було <code>{esc(res['old_serial'])}</code>, стало <code>{esc(info.get('serial'))}</code>). "
+            f"(було <code>{esc(old_serial)}</code>, стало <code>{esc(info.get('serial'))}</code>). "
             "Можливо, міст підключився до іншого пристрою акаунта — перевір."
         )
 
@@ -986,6 +1263,7 @@ async def post_init(app: Application) -> None:
     await app.bot.set_my_commands([
         BotCommand("status", "Поточний стан станції"),
         BotCommand("rename", "Назвати станцію по-своєму"),
+        BotCommand("devname", "Офіційна назва станції (адмін)"),
         BotCommand("help", "Інструкція"),
         BotCommand("schedule", "Щоденний звіт: /schedule 08:00"),
         BotCommand("every", "Звіт кожні N хв: /every 60"),
@@ -999,6 +1277,16 @@ async def post_init(app: Application) -> None:
     for chat_id, user in STORE.all_users():
         register_jobs(app, chat_id, user.get("schedule", {}))
     app.job_queue.run_repeating(check_alerts, interval=15, first=30, name="alerts")
+    app.job_queue.run_repeating(sync_bridge_names, interval=600, first=20, name="bridge-names")
+    if STORE.data.get("ui_version") != UI_VERSION:     # меню змінилося — один раз надсилаємо всім нову клавіатуру
+        for chat_id, _ in STORE.all_users():
+            try:
+                await app.bot.send_message(chat_id, "🔄 Бот оновився: змінилося меню внизу. Інструкція — /help",
+                                           reply_markup=menu_for(chat_id))
+            except Exception as e:  # noqa: BLE001
+                log.warning("Не вдалося оновити меню в %s: %s", chat_id, e)
+        STORE.data["ui_version"] = UI_VERSION
+        STORE.save()
 
 
 def main() -> None:
@@ -1015,12 +1303,13 @@ def main() -> None:
     app.add_handler(CommandHandler("clear", cmd_clear))
     app.add_handler(CommandHandler("alerts", cmd_alerts))
     app.add_handler(CommandHandler("rename", cmd_rename))
+    app.add_handler(CommandHandler("devname", cmd_devname))
     app.add_handler(CommandHandler("invite", cmd_invite))
     app.add_handler(CommandHandler("users", cmd_users))
     app.add_handler(CommandHandler("debug", cmd_debug))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(
-        filters.Text([BTN_STATUS, BTN_SCHEDULE, BTN_ALERTS, BTN_HELP, BTN_USERS]), on_menu_text))
+        filters.Text([BTN_STATUS, BTN_CONTROL, BTN_ALERTS, BTN_STATS, BTN_SCHEDULE, BTN_HELP, BTN_USERS]), on_menu_text))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     log.info("Бот запущено")
     app.run_polling(allowed_updates=Update.ALL_TYPES)

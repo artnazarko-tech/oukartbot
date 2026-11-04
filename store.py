@@ -85,26 +85,39 @@ class Store:
         """Справжня назва станції (її повідомляє міст). Однакова для всіх користувачів."""
         return self.data["devices"].get(dev_id, {}).get("name", dev_id)
 
-    def update_device_info(self, dev_id: str, name: str | None, serial: str | None) -> dict:
-        """Фіксує назву й серійний номер, які повідомив міст.
-        Повертає {'name_changed': bool, 'old_serial': str|None} — old_serial заповнений, лише якщо серійний ЗМІНИВСЯ."""
-        res = {"name_changed": False, "old_serial": None}
+    def update_serial(self, dev_id: str, serial: str | None) -> str | None:
+        """Запам'ятовує серійний номер станції. Якщо він ЗМІНИВСЯ — повертає старий (щоб попередити адміна)."""
         with self._lock:
             dev = self.data["devices"].get(dev_id)
-            if dev is None:
-                return res
-            changed = False
-            if name and dev.get("name") != name:
-                dev["name"] = name
-                res["name_changed"] = changed = True
-            if serial and dev.get("serial") != serial:
-                if dev.get("serial"):
-                    res["old_serial"] = dev["serial"]
-                dev["serial"] = serial
-                changed = True
-            if changed:
+            if dev is None or not serial or dev.get("serial") == serial:
+                return None
+            old = dev.get("serial")
+            dev["serial"] = serial
+            self.save()
+            return old
+
+    def set_device_name(self, dev_id: str, name: str, src: str) -> bool:
+        """Офіційна назва станції (однакова для всіх). src: 'log' — знайшли в журналі моста,
+        'manual' — задав адмін. Ручна назва сильніша за автоматичну."""
+        with self._lock:
+            dev = self.data["devices"].get(dev_id)
+            if dev is None or not name:
+                return False
+            if dev.get("name_src") == "manual" and src != "manual":
+                return False
+            if dev.get("name") == name and dev.get("name_src") == src:
+                return False
+            dev["name"], dev["name_src"] = name, src
+            self.save()
+            return True
+
+    def clear_manual_name(self, dev_id: str) -> None:
+        """Забуває ручну назву: далі її знову підставить назва з журналу моста."""
+        with self._lock:
+            dev = self.data["devices"].get(dev_id)
+            if dev is not None and dev.get("name_src") == "manual":
+                dev["name_src"] = None
                 self.save()
-        return res
 
     def full_name(self, dev_id: str) -> str:
         """'Oukitel P2001E Plus №2' — для адміна й для розрізнення однакових станцій."""
