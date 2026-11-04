@@ -16,6 +16,7 @@ Telegram-бот для моніторингу зарядної станції Ou
 ("світло зникло / з'явилося"), аварійні стани, відсутність даних.
 """
 
+import html
 import json
 import logging
 import os
@@ -32,6 +33,9 @@ from telegram import (BotCommand, InlineKeyboardButton, InlineKeyboardMarkup,
 from telegram.error import BadRequest
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
                           ContextTypes, MessageHandler, filters)
+
+from store import (ROLE_ADMIN, ROLE_GUEST, ROLE_OWNER, ROLE_TITLES, Store,
+                   import_legacy_schedules)
 
 load_dotenv()
 
@@ -52,7 +56,10 @@ INPUT_ON_W = float(os.getenv("ALERT_INPUT_ON_W", "30"))      # вхід вваж
 INPUT_DEBOUNCE_S = int(os.getenv("ALERT_INPUT_DEBOUNCE_S", "60"))
 STALE_AFTER_S = int(os.getenv("STALE_AFTER_S", "300"))
 
-DATA_FILE = Path(os.getenv("DATA_FILE", "data/schedules.json"))
+DATA_FILE = Path(os.getenv("DATA_FILE", "data/schedules.json"))   # старий файл (версія 1), лише для міграції
+STORE_FILE = Path(os.getenv("STORE_FILE", "data/store.json"))
+DEFAULT_DEVICE_ID = "main"
+DEFAULT_DEVICE_NAME = os.getenv("DEVICE_NAME", "Oukitel P2001E Plus")
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
 log = logging.getLogger("oukitel-bot")
@@ -69,8 +76,8 @@ class StationState:
         self.raw: dict[str, str] = {}
         self.updated: float = 0.0
 
-    def update(self, topic: str, payload: bytes) -> None:
-        key = topic_to_key(topic)
+    def update(self, topic: str, payload: bytes, base: str) -> None:
+        key = topic_to_key(topic, base)
         if key is None:
             return
         text = payload.decode("utf-8", errors="replace").strip()
@@ -94,11 +101,11 @@ class StationState:
             return dict(self.raw)
 
 
-def topic_to_key(topic: str) -> str | None:
+def topic_to_key(topic: str, base: str) -> str | None:
     """'homeassistant/sensor/oukitel/battery/state' -> 'battery'. Конфіг-топіки ігноруються."""
-    if not topic.startswith(MQTT_TOPIC_BASE):
+    if not topic.startswith(base):
         return None
-    rest = topic[len(MQTT_TOPIC_BASE):].strip("/")
+    rest = topic[len(base):].strip("/")
     parts = [p for p in rest.split("/") if p]
     if not parts or parts[-1] in ("config", "attributes", "set", "command"):
         return None
@@ -121,7 +128,13 @@ def parse_value(text: str):
     return t
 
 
-STATE = StationState()
+# Стан кожного пристрою окремо: {"main": StationState, ...}
+STATES: dict[str, StationState] = {}
+STORE: Store = None  # type: ignore[assignment]  # створюється в main()
+
+
+def state_of(dev_id: str) -> StationState:
+    return STATES.setdefault(dev_id, StationState())
 
 
 def num(values: dict, *keys: str) -> float | None:
@@ -151,7 +164,7 @@ def battery_icon(p: float) -> str:
     return "🔋" if p >= 30 else "🪫"
 
 
-def format_status(values: dict, updated: float) -> str:
+def format_status(values: dict, updated: float, name: str = "Зарядна станція") -> str:
     if not updated:
         return "⏳ Даних від станції ще немає. Перевір, що міст oukitel-portable-bridge запущено і він пише в MQTT (/debug)."
 
@@ -167,7 +180,7 @@ def format_status(values: dict, updated: float) -> str:
     charge_t = num(values, "remain_charging_time", "remaining_charge_time")
     fault = values.get("hardware_fault_status")
 
-    lines = ["⚡ <b>Зарядна станція</b>"]
+    lines = [f"⚡ <b>{name}</b>"]
     if bat is not None:
         lines.append(f"{battery_icon(bat)} Заряд: <b>{bat:.0f}%</b>")
 
@@ -205,22 +218,41 @@ def format_status(values: dict, updated: float) -> str:
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------- допоміжне
+B = InlineKeyboardButton
+
+
+def esc(text: object) -> str:
+    return html.escape(str(text))
+
+
+def status_text(dev_id: str) -> str:
+    values, updated = state_of(dev_id).snapshot()
+    return format_status(values, updated, esc(STORE.device_name(dev_id)))
+
+
+def role_summary(chat_id: int) -> str:
+    """'Адмін' або 'Моя 1 кВт: Власник, Мама 2 кВт: Гість'."""
+    if STORE.is_admin(chat_id):
+        return ROLE_TITLES[ROLE_ADMIN]
+    parts = [f"{esc(STORE.device_name(d))}: {ROLE_TITLES[STORE.role(chat_id, d)]}"
+             for d in STORE.devices_for(chat_id)]
+    return ", ".join(parts) or "без доступу"
+
+
 # ---------------------------------------------------------------- розклади
-def load_schedules() -> dict:
+def load_legacy_schedules() -> dict:
+    """Старий файл розкладів (версія 1) — потрібен лише для одноразової міграції."""
     try:
         return json.loads(DATA_FILE.read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
 
 
-def save_schedules(data: dict) -> None:
-    DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
-    DATA_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
 async def send_report(context: ContextTypes.DEFAULT_TYPE) -> None:
-    values, updated = STATE.snapshot()
-    await context.bot.send_message(context.job.chat_id, format_status(values, updated), parse_mode="HTML")
+    chat_id = context.job.chat_id
+    for dev_id in STORE.devices_for(chat_id):
+        await context.bot.send_message(chat_id, status_text(dev_id), parse_mode="HTML")
 
 
 def register_jobs(app: Application, chat_id: int, cfg: dict) -> None:
@@ -237,43 +269,93 @@ def register_jobs(app: Application, chat_id: int, cfg: dict) -> None:
 
 # ---------------------------------------------------------------- доступ
 def allowed(update: Update) -> bool:
-    return not ALLOWED_CHAT_IDS or update.effective_chat.id in ALLOWED_CHAT_IDS
+    return STORE.get_user(update.effective_chat.id) is not None
 
 
-def alert_chats(app: Application) -> set[int]:
-    chats = set(ALLOWED_CHAT_IDS)
-    chats.update(int(c) for c in app.bot_data.get("schedules", {}).keys())
-    chats.update(app.bot_data.get("seen_chats", set()))
-    return chats
+def is_admin(update: Update) -> bool:
+    return STORE.is_admin(update.effective_chat.id)
+
+
+# ---------------------------------------------------------------- кнопки (константи)
+BTN_STATUS = "📊 Стан"
+BTN_SCHEDULE = "⏰ Розклад"
+BTN_ALERTS = "🔔 Сповіщення"
+BTN_HELP = "ℹ️ Допомога"
+BTN_USERS = "👥 Користувачі"
+
+
+def menu_for(chat_id: int) -> ReplyKeyboardMarkup:
+    """Постійне меню внизу екрана. Адмін додатково бачить «Користувачі»."""
+    last = [KeyboardButton(BTN_HELP)]
+    if STORE.is_admin(chat_id):
+        last.append(KeyboardButton(BTN_USERS))
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton(BTN_STATUS)], [KeyboardButton(BTN_SCHEDULE), KeyboardButton(BTN_ALERTS)], last],
+        resize_keyboard=True, is_persistent=True,
+    )
+
+
+def status_kb(dev_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[B("🔄 Оновити", callback_data=f"status:refresh:{dev_id}")]])
+
+
+PRESET_TIMES = ["07:00", "09:00", "12:00", "15:00", "18:00", "21:00", "23:00"]
+PRESET_INTERVALS = [(0, "вимк"), (30, "30 хв"), (60, "1 год"), (180, "3 год")]
 
 
 # ---------------------------------------------------------------- команди
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
+    name = update.effective_user.full_name if update.effective_user else ""
+
+    # перше підключення: якщо адміна ще немає і ALLOWED_CHAT_IDS порожній — перший стає адміном
+    if STORE.get_user(chat_id) is None and not ALLOWED_CHAT_IDS \
+            and not any(u.get("admin") for _, u in STORE.all_users()):
+        STORE.ensure_admin(chat_id, name)
+        log.warning("Адміна не було — %s призначено адміном. Додай його chat_id у ALLOWED_CHAT_IDS", chat_id)
+
+    # запрошення: t.me/<бот>?start=inv_КОД
+    if context.args and context.args[0].startswith("inv_"):
+        if STORE.use_invite(context.args[0][4:], chat_id, name):
+            await update.message.reply_text("✅ Запрошення прийнято!")
+        elif not allowed(update):
+            await update.message.reply_text("⛔ Запрошення недійсне або вже використане. Попроси адміна створити нове.")
+            return
+
     if not allowed(update):
-        await update.message.reply_text(f"⛔ Доступ заборонено. Твій chat_id: {chat_id}")
+        await update.message.reply_text(
+            f"⛔ Доступ лише за запрошенням. Твій chat_id: {chat_id}\n"
+            "Попроси адміна надіслати тобі посилання-запрошення."
+        )
         return
-    context.application.bot_data.setdefault("seen_chats", set()).add(chat_id)
+
+    extra = "\n/invite — запросити людину\n/users — користувачі та доступи" if is_admin(update) else ""
     await update.message.reply_text(
-        "👋 Я стежу за зарядною станцією Oukitel.\n\n"
+        "👋 Я стежу за зарядними станціями Oukitel.\n\n"
+        f"Твій доступ: <b>{role_summary(chat_id)}</b>\n\n"
         "Користуйся кнопками внизу 👇\n\n"
         "Команди теж працюють:\n"
         "/status — поточний стан\n"
         "/schedule 08:00 — щоденний звіт у свій час\n"
-        "/every 60 — звіт кожні N хвилин\n"
-        "/debug — сирі дані MQTT\n\n"
+        "/every 60 — звіт кожні N хвилин"
+        f"{extra}\n\n"
         f"Твій chat_id: <code>{chat_id}</code>",
         parse_mode="HTML",
-        reply_markup=MAIN_MENU,
+        reply_markup=menu_for(chat_id),
     )
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not allowed(update):
         return
-    values, updated = STATE.snapshot()
-    await update.message.reply_text(format_status(values, updated), parse_mode="HTML",
-                                    reply_markup=STATUS_KB)
+    devs = STORE.devices_for(update.effective_chat.id)
+    if not devs:
+        await update.message.reply_text("У тебе поки немає доступу до жодної станції. Попроси адміна.")
+    elif len(devs) == 1:
+        await update.message.reply_text(status_text(devs[0]), parse_mode="HTML", reply_markup=status_kb(devs[0]))
+    else:
+        await update.message.reply_text("Яка станція?", reply_markup=InlineKeyboardMarkup(
+            [[B(STORE.device_name(d), callback_data=f"dev:status:{d}")] for d in devs]))
 
 
 async def cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -292,10 +374,9 @@ async def cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         except Exception:
             await update.message.reply_text(f"Не розумію час «{a}». Формат: ГГ:ХХ")
             return
-    data = context.application.bot_data["schedules"]
-    cfg = data.setdefault(str(chat_id), {"times": [], "interval_min": 0})
+    cfg = STORE.schedule(chat_id)
     cfg["times"] = sorted(set(cfg["times"]) | set(times))
-    save_schedules(data)
+    STORE.save()
     register_jobs(context.application, chat_id, cfg)
     await update.message.reply_text(f"✅ Щоденні звіти о: {', '.join(cfg['times'])}")
 
@@ -310,10 +391,9 @@ async def cmd_every(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception:
         await update.message.reply_text("Формат: /every 60  (хвилини, 0 — вимкнути)")
         return
-    data = context.application.bot_data["schedules"]
-    cfg = data.setdefault(str(chat_id), {"times": [], "interval_min": 0})
+    cfg = STORE.schedule(chat_id)
     cfg["interval_min"] = minutes
-    save_schedules(data)
+    STORE.save()
     register_jobs(context.application, chat_id, cfg)
     await update.message.reply_text(
         f"✅ Звіт кожні {minutes} хв" if minutes else "✅ Періодичні звіти вимкнено"
@@ -323,8 +403,8 @@ async def cmd_every(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_schedules(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not allowed(update):
         return
-    cfg = context.application.bot_data["schedules"].get(str(update.effective_chat.id))
-    if not cfg or (not cfg.get("times") and not cfg.get("interval_min")):
+    cfg = STORE.schedule(update.effective_chat.id)
+    if not cfg.get("times") and not cfg.get("interval_min"):
         await update.message.reply_text("Розклад порожній. Додай: /schedule 08:00 або /every 60")
         return
     parts = []
@@ -339,10 +419,10 @@ async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not allowed(update):
         return
     chat_id = update.effective_chat.id
-    data = context.application.bot_data["schedules"]
-    data[str(chat_id)] = {"times": [], "interval_min": 0}
-    save_schedules(data)
-    register_jobs(context.application, chat_id, data[str(chat_id)])
+    cfg = STORE.schedule(chat_id)
+    cfg["times"], cfg["interval_min"] = [], 0
+    STORE.save()
+    register_jobs(context.application, chat_id, cfg)
     await update.message.reply_text("🗑 Розклад очищено (сповіщення про події залишаються)")
 
 
@@ -361,45 +441,90 @@ async def cmd_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not allowed(update):
+    if not allowed(update) or not is_admin(update):
         return
-    raw = STATE.raw_snapshot()
-    if not raw:
-        await update.message.reply_text(
-            f"MQTT-повідомлень не отримано.\nБрокер: {MQTT_HOST}:{MQTT_PORT}\nТопік: {MQTT_TOPIC_BASE}/#"
-        )
-        return
-    lines = [f"{t.removeprefix(MQTT_TOPIC_BASE + '/')} = {v[:60]}" for t, v in sorted(raw.items())]
-    text = "\n".join(lines)
+    chunks = []
+    for dev_id, info in STORE.devices().items():
+        base = info["topic_base"]
+        raw = state_of(dev_id).raw_snapshot()
+        if not raw:
+            chunks.append(f"[{info['name']}] MQTT-повідомлень не отримано.\nБрокер: {MQTT_HOST}:{MQTT_PORT}\nТопік: {base}/#")
+            continue
+        lines = [f"{t.removeprefix(base + '/')} = {v[:60]}" for t, v in sorted(raw.items())]
+        chunks.append(f"[{info['name']}]\n" + "\n".join(lines))
+    text = "\n\n".join(chunks)
     for i in range(0, len(text), 3800):
         await update.message.reply_text(text[i:i + 3800])
 
 
-# ---------------------------------------------------------------- кнопки
-BTN_STATUS = "📊 Стан"
-BTN_SCHEDULE = "⏰ Розклад"
-BTN_ALERTS = "🔔 Сповіщення"
-BTN_HELP = "ℹ️ Допомога"
-
-# Постійне меню внизу екрана (замість клавіатури)
-MAIN_MENU = ReplyKeyboardMarkup(
-    [[KeyboardButton(BTN_STATUS)], [KeyboardButton(BTN_SCHEDULE), KeyboardButton(BTN_ALERTS)],
-     [KeyboardButton(BTN_HELP)]],
-    resize_keyboard=True,
-    is_persistent=True,
-)
-
-# Кнопка під повідомленням зі станом
-STATUS_KB = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Оновити", callback_data="status:refresh")]])
-
-PRESET_TIMES = ["07:00", "09:00", "12:00", "15:00", "18:00", "21:00", "23:00"]
-PRESET_INTERVALS = [(0, "вимк"), (30, "30 хв"), (60, "1 год"), (180, "3 год")]
-
-
-def get_cfg(app: Application, chat_id: int) -> dict:
-    return app.bot_data["schedules"].setdefault(str(chat_id), {"times": [], "interval_min": 0})
+# ---------------------------------------------------------------- запрошення та користувачі (адмін)
+def invite_view(inv: dict) -> tuple[str, InlineKeyboardMarkup]:
+    devs = STORE.devices()
+    chosen = [d for d in devs if d in inv["devs"]]
+    names = ", ".join(esc(devs[d]["name"]) for d in chosen) or "не обрано"
+    text = (
+        "➕ <b>Нове запрошення</b>\n\n"
+        f"Роль: <b>{ROLE_TITLES[inv['role']]}</b>\n"
+        f"Станції: <b>{names}</b>\n\n"
+        "Власник керує обраними станціями, гість лише дивиться.\n"
+        "Обери й натисни «Створити посилання»."
+    )
+    rows = [[B(("● " if inv["role"] == r else "") + ROLE_TITLES[r], callback_data=f"inv:role:{r}")
+             for r in (ROLE_GUEST, ROLE_OWNER)]]
+    for d, info in devs.items():
+        rows.append([B(("✅ " if d in inv["devs"] else "⬜ ") + info["name"], callback_data=f"inv:dev:{d}")])
+    rows.append([B("🔗 Створити посилання", callback_data="inv:make")])
+    return text, InlineKeyboardMarkup(rows)
 
 
+async def cmd_invite(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not allowed(update) or not is_admin(update):
+        return
+    devs = list(STORE.devices())
+    inv = {"role": ROLE_GUEST, "devs": set(devs) if len(devs) == 1 else set()}
+    context.user_data["invite"] = inv
+    text, kb = invite_view(inv)
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=kb)
+
+
+def users_view() -> tuple[str, InlineKeyboardMarkup]:
+    users = STORE.all_users()
+    lines = ["👥 <b>Користувачі</b>\n"]
+    rows = []
+    for cid, u in users:
+        title = u.get("name") or str(cid)
+        lines.append(f"• {esc(title)} — {role_summary(cid)}")
+        rows.append([B(f"👤 {title}", callback_data=f"usr:open:{cid}")])
+    lines.append("\nНатисни на людину, щоб змінити доступ. Нових людей додає /invite.")
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+
+def user_card(cid: int) -> tuple[str, InlineKeyboardMarkup]:
+    u = STORE.get_user(cid) or {}
+    title = u.get("name") or str(cid)
+    rows = []
+    if u.get("admin"):
+        text = f"👤 <b>{esc(title)}</b>\n\nАдмін: доступ до всього. Задається в .env (ALLOWED_CHAT_IDS)."
+    else:
+        text = (f"👤 <b>{esc(title)}</b>\n\nНатискай на станцію, щоб змінити роль:\n"
+                "— немає доступу → Гість → Власник → немає доступу")
+        for d, info in STORE.devices().items():
+            r = STORE.role(cid, d)
+            label = ROLE_TITLES[r] if r else "—"
+            rows.append([B(f"{info['name']}: {label}", callback_data=f"usr:cyc:{cid}:{d}")])
+        rows.append([B("🗑 Видалити користувача", callback_data=f"usr:del:{cid}")])
+    rows.append([B("⬅️ Назад", callback_data="usr:list")])
+    return text, InlineKeyboardMarkup(rows)
+
+
+async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not allowed(update) or not is_admin(update):
+        return
+    text, kb = users_view()
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=kb)
+
+
+# ---------------------------------------------------------------- кнопки під повідомленнями
 def schedule_text(cfg: dict) -> str:
     times = ", ".join(cfg.get("times") or []) or "немає"
     interval = cfg.get("interval_min") or 0
@@ -416,27 +541,27 @@ def schedule_text(cfg: dict) -> str:
 def schedule_kb(cfg: dict) -> InlineKeyboardMarkup:
     chosen = set(cfg.get("times") or [])
     time_btns = [
-        InlineKeyboardButton(("✅ " if t in chosen else "") + t, callback_data=f"sch:t:{t}")
+        B(("✅ " if t in chosen else "") + t, callback_data=f"sch:t:{t}")
         for t in PRESET_TIMES
     ]
     rows = [time_btns[i:i + 4] for i in range(0, len(time_btns), 4)]
     # нестандартні часи, додані командою, теж показуємо, щоб їх можна було прибрати
     custom = [t for t in sorted(chosen) if t not in PRESET_TIMES]
     if custom:
-        rows.append([InlineKeyboardButton(f"✅ {t}", callback_data=f"sch:t:{t}") for t in custom][:4])
+        rows.append([B(f"✅ {t}", callback_data=f"sch:t:{t}") for t in custom][:4])
     cur = cfg.get("interval_min") or 0
     rows.append([
-        InlineKeyboardButton(("● " if cur == m else "") + label, callback_data=f"sch:i:{m}")
+        B(("● " if cur == m else "") + label, callback_data=f"sch:i:{m}")
         for m, label in PRESET_INTERVALS
     ])
-    rows.append([InlineKeyboardButton("🗑 Очистити все", callback_data="sch:clear")])
+    rows.append([B("🗑 Очистити все", callback_data="sch:clear")])
     return InlineKeyboardMarkup(rows)
 
 
 async def show_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not allowed(update):
         return
-    cfg = get_cfg(context.application, update.effective_chat.id)
+    cfg = STORE.schedule(update.effective_chat.id)
     await update.message.reply_text(schedule_text(cfg), parse_mode="HTML", reply_markup=schedule_kb(cfg))
 
 
@@ -453,6 +578,8 @@ async def on_menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await cmd_alerts(update, context)
     elif text == BTN_HELP:
         await cmd_start(update, context)
+    elif text == BTN_USERS:
+        await cmd_users(update, context)
 
 
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -466,15 +593,19 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     app = context.application
 
     try:
-        if data == "status:refresh":
-            values, updated = STATE.snapshot()
+        # --- стан станції
+        if data.startswith(("status:refresh:", "dev:status:")):
+            dev_id = data.split(":", 2)[2]
+            if not STORE.role(chat_id, dev_id):
+                await query.answer("⛔ Немає доступу до цієї станції")
+                return
             await query.answer("Оновлено")
-            await query.edit_message_text(format_status(values, updated), parse_mode="HTML",
-                                          reply_markup=STATUS_KB)
+            await query.edit_message_text(status_text(dev_id), parse_mode="HTML", reply_markup=status_kb(dev_id))
             return
 
+        # --- розклад
         if data.startswith("sch:"):
-            cfg = get_cfg(app, chat_id)
+            cfg = STORE.schedule(chat_id)
             _, kind, *rest = data.split(":", 2)
             if kind == "t":
                 t = rest[0]
@@ -488,9 +619,74 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             elif kind == "clear":
                 cfg["times"], cfg["interval_min"] = [], 0
                 await query.answer("Розклад очищено")
-            save_schedules(app.bot_data["schedules"])
+            STORE.save()
             register_jobs(app, chat_id, cfg)
             await query.edit_message_text(schedule_text(cfg), parse_mode="HTML", reply_markup=schedule_kb(cfg))
+            return
+
+        # --- далі лише для адміна
+        if data.startswith(("inv:", "usr:")) and not is_admin(update):
+            await query.answer("⛔ Лише для адміна")
+            return
+
+        if data.startswith("inv:"):
+            inv = context.user_data.get("invite")
+            if inv is None:
+                await query.answer("Запрошення застаріло. Почни знову: /invite", show_alert=True)
+                return
+            _, kind, *rest = data.split(":", 2)
+            if kind == "role" and rest[0] in (ROLE_GUEST, ROLE_OWNER):
+                inv["role"] = rest[0]
+            elif kind == "dev" and rest[0] in STORE.devices():
+                inv["devs"].symmetric_difference_update({rest[0]})
+            elif kind == "make":
+                if not inv["devs"]:
+                    await query.answer("Обери хоча б одну станцію", show_alert=True)
+                    return
+                code = STORE.create_invite(inv["role"], sorted(inv["devs"]), created_by=chat_id)
+                link = f"https://t.me/{context.bot.username}?start=inv_{code}"
+                context.user_data.pop("invite", None)
+                await query.answer("Готово")
+                await query.edit_message_text(
+                    f"🔗 Посилання для <b>{ROLE_TITLES[inv['role']]}</b>:\n\n<code>{link}</code>\n\n"
+                    "Одноразове, діє 48 годин. Надішли його людині — вона натисне й побачить «Запустити».",
+                    parse_mode="HTML",
+                )
+                return
+            text, kb = invite_view(inv)
+            await query.answer()
+            await query.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
+            return
+
+        if data.startswith("usr:"):
+            _, kind, *rest = data.split(":", 2)
+            if kind == "list":
+                text, kb = users_view()
+            else:
+                cid_s, _, dev_id = rest[0].partition(":")
+                cid = int(cid_s)
+                user = STORE.get_user(cid)
+                if user is None:
+                    await query.answer("Користувача не знайдено")
+                    text, kb = users_view()
+                elif kind == "open":
+                    text, kb = user_card(cid)
+                elif user.get("admin"):
+                    await query.answer("Адміна тут змінити не можна")
+                    text, kb = user_card(cid)
+                elif kind == "cyc" and dev_id in STORE.devices():
+                    nxt = {None: ROLE_GUEST, ROLE_GUEST: ROLE_OWNER, ROLE_OWNER: None}[STORE.role(cid, dev_id)]
+                    STORE.set_access(cid, dev_id, nxt)
+                    text, kb = user_card(cid)
+                elif kind == "del":
+                    STORE.remove_user(cid)
+                    register_jobs(app, cid, {"times": [], "interval_min": 0})   # прибрати його будильники
+                    await query.answer("Користувача видалено")
+                    text, kb = users_view()
+                else:
+                    text, kb = user_card(cid)
+            await query.answer()
+            await query.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
             return
 
         await query.answer()
@@ -501,26 +697,24 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ---------------------------------------------------------------- сповіщення
-async def check_alerts(context: ContextTypes.DEFAULT_TYPE) -> None:
-    app = context.application
-    st = app.bot_data.setdefault("alert_state", {})
-    values, updated = STATE.snapshot()
+def collect_alerts(app: Application, dev_id: str) -> list[str]:
+    """Порівнює поточний стан пристрою з попереднім і повертає список нових повідомлень."""
+    st = app.bot_data.setdefault("alert_state", {}).setdefault(dev_id, {})
+    values, updated = state_of(dev_id).snapshot()
     msgs: list[str] = []
     now = time.time()
 
     # немає даних
-    if updated:
-        stale = now - updated > STALE_AFTER_S
-        if stale and not st.get("stale"):
-            msgs.append(f"📡 Від станції немає даних уже {int((now - updated) // 60)} хв")
-        elif not stale and st.get("stale"):
-            msgs.append("📡 Зв'язок зі станцією відновлено")
-        st["stale"] = stale
-        if stale:
-            await _broadcast(app, msgs)
-            return
-    else:
-        return
+    if not updated:
+        return msgs
+    stale = now - updated > STALE_AFTER_S
+    if stale and not st.get("stale"):
+        msgs.append(f"📡 Від станції немає даних уже {int((now - updated) // 60)} хв")
+    elif not stale and st.get("stale"):
+        msgs.append("📡 Зв'язок зі станцією відновлено")
+    st["stale"] = stale
+    if stale:
+        return msgs
 
     bat = num(values, "battery", "battery_level", "soc")
     if bat is not None:
@@ -563,32 +757,51 @@ async def check_alerts(context: ContextTypes.DEFAULT_TYPE) -> None:
             msgs.append(f"⚠️ Станція повідомляє: <b>{fault}</b>")
         st["fault"] = fault if fault.lower() != "normal" else None
 
-    await _broadcast(app, msgs)
+    return msgs
 
 
-async def _broadcast(app: Application, msgs: list[str]) -> None:
-    if not msgs:
-        return
-    text = "\n".join(msgs)
-    for chat_id in alert_chats(app):
-        try:
-            await app.bot.send_message(chat_id, text, parse_mode="HTML")
-        except Exception as e:  # noqa: BLE001
-            log.warning("Не вдалося надіслати в %s: %s", chat_id, e)
+async def check_alerts(context: ContextTypes.DEFAULT_TYPE) -> None:
+    app = context.application
+    devices = STORE.devices()
+    for dev_id, info in devices.items():
+        msgs = collect_alerts(app, dev_id)
+        if not msgs:
+            continue
+        text = "\n".join(msgs)
+        if len(devices) > 1:   # кілька станцій — підписуємо, про яку мова
+            text = f"<b>{esc(info['name'])}</b>\n{text}"
+        for chat_id in STORE.users_for_device(dev_id):
+            try:
+                await app.bot.send_message(chat_id, text, parse_mode="HTML")
+            except Exception as e:  # noqa: BLE001
+                log.warning("Не вдалося надіслати в %s: %s", chat_id, e)
 
 
 # ---------------------------------------------------------------- MQTT
+def device_for_topic(topic: str) -> tuple[str, str] | None:
+    """Знаходить пристрій за топіком (береться найдовший збіг префікса)."""
+    best = None
+    for dev_id, info in STORE.devices().items():
+        base = info["topic_base"]
+        if topic.startswith(base + "/") and (best is None or len(base) > len(best[1])):
+            best = (dev_id, base)
+    return best
+
+
 def start_mqtt() -> mqtt.Client:
     client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="oukitel-telegram-bot")
     if MQTT_USER:
         client.username_pw_set(MQTT_USER, MQTT_PASSWORD)
 
     def on_connect(c, userdata, flags, reason_code, properties):
-        log.info("MQTT підключено (%s), підписка на %s/#", reason_code, MQTT_TOPIC_BASE)
-        c.subscribe(f"{MQTT_TOPIC_BASE}/#")
+        for dev_id, info in STORE.devices().items():
+            log.info("MQTT підключено (%s), підписка на %s/# (%s)", reason_code, info["topic_base"], dev_id)
+            c.subscribe(f"{info['topic_base']}/#")
 
     def on_message(c, userdata, msg):
-        STATE.update(msg.topic, msg.payload)
+        found = device_for_topic(msg.topic)
+        if found:
+            state_of(found[0]).update(msg.topic, msg.payload, found[1])
 
     client.on_connect = on_connect
     client.on_message = on_message
@@ -599,6 +812,22 @@ def start_mqtt() -> mqtt.Client:
 
 
 # ---------------------------------------------------------------- запуск
+def bootstrap_store() -> Store:
+    """Відкриває сховище; при першому запуску v2 переносить дані зі старого schedules.json."""
+    first_run = not STORE_FILE.exists()
+    store = Store(STORE_FILE)
+    if not store.devices():
+        store.add_device(DEFAULT_DEVICE_ID, DEFAULT_DEVICE_NAME, MQTT_TOPIC_BASE)
+    if first_run:
+        n = import_legacy_schedules(store, load_legacy_schedules(), DEFAULT_DEVICE_ID)
+        log.info("Створено %s, перенесено розкладів зі старого файлу: %s", STORE_FILE, n)
+    for chat_id in ALLOWED_CHAT_IDS:
+        store.ensure_admin(chat_id)
+    if not any(u.get("admin") for _, u in store.all_users()):
+        log.warning("Адміністратора немає: перший, хто напише /start, ним стане. Додай свій chat_id у ALLOWED_CHAT_IDS")
+    return store
+
+
 async def post_init(app: Application) -> None:
     await app.bot.set_my_commands([
         BotCommand("status", "Поточний стан станції"),
@@ -607,15 +836,18 @@ async def post_init(app: Application) -> None:
         BotCommand("schedules", "Мій розклад"),
         BotCommand("clear", "Очистити розклад"),
         BotCommand("alerts", "Автоматичні сповіщення"),
-        BotCommand("debug", "Сирі дані MQTT"),
+        BotCommand("invite", "Запросити людину (адмін)"),
+        BotCommand("users", "Користувачі (адмін)"),
+        BotCommand("debug", "Сирі дані MQTT (адмін)"),
     ])
-    app.bot_data["schedules"] = load_schedules()
-    for chat_id, cfg in app.bot_data["schedules"].items():
-        register_jobs(app, int(chat_id), cfg)
+    for chat_id, user in STORE.all_users():
+        register_jobs(app, chat_id, user.get("schedule", {}))
     app.job_queue.run_repeating(check_alerts, interval=15, first=30, name="alerts")
 
 
 def main() -> None:
+    global STORE
+    STORE = bootstrap_store()
     start_mqtt()
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler(["start", "help"], cmd_start))
@@ -625,9 +857,12 @@ def main() -> None:
     app.add_handler(CommandHandler("schedules", cmd_schedules))
     app.add_handler(CommandHandler("clear", cmd_clear))
     app.add_handler(CommandHandler("alerts", cmd_alerts))
+    app.add_handler(CommandHandler("invite", cmd_invite))
+    app.add_handler(CommandHandler("users", cmd_users))
     app.add_handler(CommandHandler("debug", cmd_debug))
     app.add_handler(CallbackQueryHandler(on_button))
-    app.add_handler(MessageHandler(filters.Text([BTN_STATUS, BTN_SCHEDULE, BTN_ALERTS, BTN_HELP]), on_menu_text))
+    app.add_handler(MessageHandler(
+        filters.Text([BTN_STATUS, BTN_SCHEDULE, BTN_ALERTS, BTN_HELP, BTN_USERS]), on_menu_text))
     log.info("Бот запущено")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
