@@ -265,6 +265,15 @@ def test_status_and_detail_format():
     assert "Wi-Fi: -46 дБм" in d and "BMS 206" in d and "Вихід AC: увімкнено" in d and "Потужність заряду батареї: +330 Вт" in d
     assert not any(ch in d for ch in "✅❌⚠️🔋🌡⬇⬆")            # «суха» інформація без картинок
     assert "ще немає" in bot.format_detail({}, 0, "Дача")
+    # режим роботи: вхід ≈ вихід — це ДБЖ; значення з реальних показів станції
+    wm = bot.work_mode
+    assert "режим ДБЖ" in wm({"ac_input_watts": 0, "input_watts": 231, "output_watts": 231, "battery": 100})
+    assert wm({"ac_input_watts": 450, "output_watts": 120}) == "заряджається від мережі"
+    assert wm({"ac_input_watts": 0, "input_watts": 0, "output_watts": 215, "battery": 97}) == "живлення від батареї"
+    assert wm({"ac_input_watts": 0, "input_watts": 0, "output_watts": 0}) == "очікування" and wm({}) is None
+    off = {"battery": 97, "input_watts": 0, "ac_input_watts": 0, "output_watts": 215, "remain_time": 300}
+    assert "Режим роботи: живлення від батареї" in bot.format_detail(off, time.time(), "Д")
+    assert "Мережа: ❌ немає" in bot.format_status(off, time.time(), "Д")
 
 
 def test_menu_navigation():

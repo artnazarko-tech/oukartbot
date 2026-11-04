@@ -290,6 +290,21 @@ def grid_status_from(values: dict, last_known: bool | None) -> tuple[bool | None
     return sig == "on", True
 
 
+def work_mode(values: dict) -> str | None:
+    """Режим роботи станції за потужностями. Режиму ДБЖ як окремого прапорця станція не віддає, але коли мережа є й батарея
+    повна, вона пропускає мережу на навантаження напряму: вхід ≈ вихід. Це й є режим ДБЖ."""
+    grid, tout = grid_watts(values), num(values, "output_watts", "total_output_power", "output_power")
+    if grid is None or tout is None:
+        return None
+    if grid >= GRID_MIN_W:
+        if grid - tout > max(10.0, 0.1 * tout):
+            return "заряджається від мережі"
+        if tout >= GRID_LOAD_W:
+            return "живлення від мережі напряму (режим ДБЖ: вхід ≈ вихід), батарея в резерві"
+        return "очікування, мережа є"
+    return "живлення від батареї" if tout >= GRID_LOAD_W else "очікування"
+
+
 def grid_line(grid: tuple[bool | None, bool], short: bool = True) -> str | None:
     present, certain = grid
     if present is None:
@@ -367,6 +382,9 @@ def format_detail(values: dict, updated: float, name: str = "Станція", gr
     gline = grid_line(grid if grid is not None else grid_status_from(values, None), short=False)
     if gline:
         L.append(gline)
+    mode = work_mode(values)
+    if mode:
+        L.append(f"Режим роботи: {mode}")
     bat = num(values, "battery", "battery_level", "soc")
     if bat is not None:
         L.append(f"Заряд батареї: {bat:.0f}%")
