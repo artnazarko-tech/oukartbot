@@ -242,9 +242,15 @@ def fault_list(values: dict) -> list[str]:
 
 
 def grid_watts(values: dict) -> float | None:
-    """Потужність входу саме з мережі (AC). Якщо мост її окремо не віддає — загальний вхід."""
-    w = num(values, "ac_input_watts", "ac_input_power")
-    return w if w is not None else num(values, "input_watts", "total_input_power")
+    """Потужність, яка йде саме з мережі (розетки).
+    Поле ac_input_watts не показує «прохідне» живлення (коли станція на 100% пропускає мережу на навантаження):
+    там воно 0, хоча загальний вхід дорівнює навантаженню. Тому беремо більше з двох:
+    ac_input_watts та (загальний вхід мінус сонце/DC)."""
+    ac = num(values, "ac_input_watts", "ac_input_power")
+    total = num(values, "input_watts", "total_input_power", "input_power")
+    dc = num(values, "dc_input_watts", "dc_solar_input_power", "solar_input_watts") or 0.0
+    candidates = [v for v in (ac, None if total is None else total - dc) if v is not None]
+    return max(max(candidates), 0.0) if candidates else None
 
 
 def grid_signal(values: dict) -> str | None:
@@ -364,7 +370,7 @@ def format_detail(values: dict, updated: float, name: str = "Станція", gr
 
     tin = num(values, "input_watts", "total_input_power", "input_power")
     tout = num(values, "output_watts", "total_output_power", "output_power")
-    ac_in, dc_in = num(values, "ac_input_watts", "ac_input_power"), num(values, "dc_input_watts", "dc_solar_input_power")
+    ac_in, dc_in = grid_watts(values), num(values, "dc_input_watts", "dc_solar_input_power")
     L.append("")
     L.append(f"Вхід: {fmt_w(tin)}" + (f" (мережа {fmt_w(ac_in)}, сонце/DC {fmt_w(dc_in)})" if ac_in is not None or dc_in is not None else ""))
     ac_out, dc_out = num(values, "ac_output_power"), num(values, "dc_output_power")

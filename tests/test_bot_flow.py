@@ -332,6 +332,12 @@ def test_grid_detection_without_input_power():
     assert g({"ac_input_watts": 0, "output_watts": 0, "battery": 80, "ac_charging_limit": 80}) == "idle"   # досягла свого ліміту
     assert g({"ac_input_watts": 0, "output_watts": 50, "battery": 75, "ac_charging_limit": 80}) == "off"
     assert g({"input_watts": 300, "battery": 50}) == "on"                                   # немає ac_input_watts — беремо загальний вхід
+    # реальні показники станції: прохідне живлення — ac_input_watts=0, але загальний вхід = навантаження
+    real = {"ac_input_watts": 0, "input_watts": 231, "output_watts": 231, "dc_input_watts": 0, "battery": 100, "ac_charging_limit": 100}
+    assert bot.grid_watts(real) == 231 and g(real) == "on"
+    assert g(dict(real, input_watts=231, dc_input_watts=231)) == "idle"                     # весь вхід — сонце, мережі нема
+    assert bot.grid_watts({"ac_input_watts": 40, "input_watts": 340, "dc_input_watts": 300}) == 40
+    assert bot.grid_watts({"ac_input_watts": 0, "input_watts": 100, "dc_input_watts": 300}) == 0   # не буває від'ємної
     # пам'ять: простій не змінює останній відомий стан
     assert bot.grid_status_from({"ac_input_watts": 0, "output_watts": 0, "battery": 100}, None) == (True, False)
     assert bot.grid_status_from({"ac_input_watts": 0, "output_watts": 0, "battery": 100}, False) == (False, False)
