@@ -35,6 +35,8 @@ class Store:
         self.path = Path(path)
         self._lock = threading.RLock()
         self.data = self._load()
+        if self._ensure_indexes():
+            self.save()
 
     # ------------------------------------------------------------ файл
     def _load(self) -> dict:
@@ -45,6 +47,18 @@ class Store:
         data = _empty()
         data.update(raw)
         return data
+
+    def _ensure_indexes(self) -> bool:
+        """Кожна станція має постійний номер (№1, №2...). Старим записам номери видаються тут."""
+        changed = False
+        used = [d["index"] for d in self.data["devices"].values() if "index" in d]
+        nxt = max(used, default=0) + 1
+        for d in self.data["devices"].values():
+            if "index" not in d:
+                d["index"] = nxt
+                nxt += 1
+                changed = True
+        return changed
 
     def save(self) -> None:
         with self._lock:
@@ -60,11 +74,59 @@ class Store:
 
     def add_device(self, dev_id: str, name: str, topic_base: str) -> None:
         with self._lock:
-            self.data["devices"][dev_id] = {"name": name, "topic_base": topic_base.rstrip("/")}
+            used = [d.get("index", 0) for d in self.data["devices"].values()]
+            self.data["devices"][dev_id] = {
+                "name": name, "topic_base": topic_base.rstrip("/"),
+                "index": max(used, default=0) + 1,
+            }
             self.save()
 
     def device_name(self, dev_id: str) -> str:
+        """Справжня назва станції (її повідомляє міст). Однакова для всіх користувачів."""
         return self.data["devices"].get(dev_id, {}).get("name", dev_id)
+
+    def update_device_name(self, dev_id: str, name: str) -> bool:
+        """Оновлює назву, яку повідомив міст. Повертає True, якщо вона змінилася."""
+        with self._lock:
+            dev = self.data["devices"].get(dev_id)
+            if dev is None or not name or dev.get("name") == name:
+                return False
+            dev["name"] = name
+            self.save()
+            return True
+
+    def full_name(self, dev_id: str) -> str:
+        """'Oukitel P2001E Plus №2' — для адміна й для розрізнення однакових станцій."""
+        dev = self.data["devices"].get(dev_id, {})
+        return f"{dev.get('name', dev_id)} №{dev.get('index', '?')}"
+
+    # ------------------------------------------------------------ особисті назви
+    def alias(self, chat_id: int, dev_id: str) -> str | None:
+        user = self.get_user(chat_id)
+        return (user or {}).get("aliases", {}).get(dev_id)
+
+    def set_alias(self, chat_id: int, dev_id: str, alias: str | None) -> None:
+        """Особиста назва станції: її бачить лише цей користувач."""
+        with self._lock:
+            user = self.get_user(chat_id)
+            if user is None:
+                return
+            aliases = user.setdefault("aliases", {})
+            if alias:
+                aliases[dev_id] = alias
+            else:
+                aliases.pop(dev_id, None)
+            self.save()
+
+    def label(self, chat_id: int, dev_id: str) -> str:
+        """Як назвати станцію саме для цієї людини:
+        її власна назва → інакше назва з моста (з номером, якщо в неї є дві однакові)."""
+        alias = self.alias(chat_id, dev_id)
+        if alias:
+            return alias
+        name = self.device_name(dev_id)
+        same = [d for d in self.devices_for(chat_id) if self.device_name(d) == name]
+        return self.full_name(dev_id) if len(same) > 1 else name
 
     # ------------------------------------------------------------ користувачі
     def get_user(self, chat_id: int) -> dict | None:

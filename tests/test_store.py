@@ -70,6 +70,31 @@ def test_legacy_import():
     assert s.role(123, "main") == ROLE_ADMIN and s.schedule(123)["times"] == ["08:00"]
 
 
+def test_indexes_aliases_labels():
+    s = fresh()
+    assert [s.devices()[d]["index"] for d in ("main", "mama")] == [1, 2]
+    s.add_device("dacha", "Мама 2 кВт", "homeassistant/sensor/oukitel_dacha")         # однакова назва
+    assert s.devices()["dacha"]["index"] == 3
+    s.add_user(2, "Мама"); s.set_access(2, "mama", ROLE_OWNER); s.set_access(2, "dacha", ROLE_OWNER)
+    assert s.label(2, "mama") == "Мама 2 кВт №2" and s.label(2, "dacha") == "Мама 2 кВт №3"
+    s.set_access(2, "dacha", None)
+    assert s.label(2, "mama") == "Мама 2 кВт"                    # дублів у неї немає — без номера
+    s.set_alias(2, "mama", "Кухня")
+    assert s.label(2, "mama") == "Кухня" and s.device_name("mama") == "Мама 2 кВт"
+    assert Store(s.path).label(2, "mama") == "Кухня"             # зберігається
+    s.set_alias(2, "mama", None)
+    assert s.label(2, "mama") == "Мама 2 кВт"
+
+
+def test_old_store_gets_indexes():
+    s = fresh()
+    for d in s.data["devices"].values():
+        d.pop("index")                                           # як у файлі, створеному етапом 1
+    s.save()
+    s2 = Store(s.path)
+    assert sorted(d["index"] for d in s2.devices().values()) == [1, 2]
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

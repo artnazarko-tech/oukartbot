@@ -75,8 +75,12 @@ class StationState:
         self.values: dict[str, object] = {}
         self.raw: dict[str, str] = {}
         self.updated: float = 0.0
+        self.meta: dict[str, str] = {}      # дані про пристрій від моста (назва, модель)
 
     def update(self, topic: str, payload: bytes, base: str) -> None:
+        if topic.rstrip("/").endswith("/config"):
+            self._read_discovery(payload)       # опис пристрою, який міст публікує для Home Assistant
+            return
         key = topic_to_key(topic, base)
         if key is None:
             return
@@ -91,6 +95,18 @@ class StationState:
             else:
                 self.values[key] = value
             self.updated = time.time()
+
+    def _read_discovery(self, payload: bytes) -> None:
+        try:
+            info = json.loads(payload.decode("utf-8", errors="replace")).get("device", {})
+        except (json.JSONDecodeError, AttributeError):
+            return
+        if not isinstance(info, dict):
+            return
+        with self._lock:
+            for field in ("name", "model", "manufacturer"):
+                if isinstance(info.get(field), str) and info[field].strip():
+                    self.meta[field] = info[field].strip()
 
     def snapshot(self) -> tuple[dict, float]:
         with self._lock:
@@ -166,7 +182,7 @@ def battery_icon(p: float) -> str:
 
 def format_status(values: dict, updated: float, name: str = "Зарядна станція") -> str:
     if not updated:
-        return "⏳ Даних від станції ще немає. Перевір, що міст oukitel-portable-bridge запущено і він пише в MQTT (/debug)."
+        return f"⚡ <b>{name}</b>\n⏳ Даних від станції ще немає. Спробуй за хвилину."
 
     bat = num(values, "battery", "battery_level", "soc")
     tin = num(values, "input_watts", "total_input_power", "input_power")
@@ -226,16 +242,16 @@ def esc(text: object) -> str:
     return html.escape(str(text))
 
 
-def status_text(dev_id: str) -> str:
+def status_text(dev_id: str, chat_id: int) -> str:
     values, updated = state_of(dev_id).snapshot()
-    return format_status(values, updated, esc(STORE.device_name(dev_id)))
+    return format_status(values, updated, esc(STORE.label(chat_id, dev_id)))
 
 
-def role_summary(chat_id: int) -> str:
-    """'Адмін' або 'Моя 1 кВт: Власник, Мама 2 кВт: Гість'."""
+def role_summary(chat_id: int, full: bool = False) -> str:
+    """'Адмін' або 'Моя 1 кВт: Власник, Мама 2 кВт: Гість'. full=True — з номерами станцій (для адміна)."""
     if STORE.is_admin(chat_id):
         return ROLE_TITLES[ROLE_ADMIN]
-    parts = [f"{esc(STORE.device_name(d))}: {ROLE_TITLES[STORE.role(chat_id, d)]}"
+    parts = [f"{esc(STORE.full_name(d) if full else STORE.label(chat_id, d))}: {ROLE_TITLES[STORE.role(chat_id, d)]}"
              for d in STORE.devices_for(chat_id)]
     return ", ".join(parts) or "без доступу"
 
@@ -252,7 +268,7 @@ def load_legacy_schedules() -> dict:
 async def send_report(context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = context.job.chat_id
     for dev_id in STORE.devices_for(chat_id):
-        await context.bot.send_message(chat_id, status_text(dev_id), parse_mode="HTML")
+        await context.bot.send_message(chat_id, status_text(dev_id, chat_id), parse_mode="HTML")
 
 
 def register_jobs(app: Application, chat_id: int, cfg: dict) -> None:
@@ -296,7 +312,8 @@ def menu_for(chat_id: int) -> ReplyKeyboardMarkup:
 
 
 def status_kb(dev_id: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[B("🔄 Оновити", callback_data=f"status:refresh:{dev_id}")]])
+    return InlineKeyboardMarkup([[B("🔄 Оновити", callback_data=f"status:refresh:{dev_id}"),
+                                  B("✏️ Назва", callback_data=f"ren:{dev_id}")]])
 
 
 PRESET_TIMES = ["07:00", "09:00", "12:00", "15:00", "18:00", "21:00", "23:00"]
@@ -329,20 +346,39 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    extra = "\n/invite — запросити людину\n/users — користувачі та доступи" if is_admin(update) else ""
     await update.message.reply_text(
-        "👋 Я стежу за зарядними станціями Oukitel.\n\n"
+        "👋 Я стежу за домашніми девайсами.\n\n"
         f"Твій доступ: <b>{role_summary(chat_id)}</b>\n\n"
-        "Користуйся кнопками внизу 👇\n\n"
-        "Команди теж працюють:\n"
-        "/status — поточний стан\n"
-        "/schedule 08:00 — щоденний звіт у свій час\n"
-        "/every 60 — звіт кожні N хвилин"
-        f"{extra}\n\n"
-        f"Твій chat_id: <code>{chat_id}</code>",
+        "Що я вмію і як цим користуватися — в інструкції: /help",
         parse_mode="HTML",
         reply_markup=menu_for(chat_id),
     )
+
+
+HELP_COMMON = (
+    "📖 <b>Інструкція</b>\n\n"
+    "📊 <b>Стан</b> — поточні показники станції: заряд, вхід і вихід у Вт, "
+    "скільки ще пропрацює або скільки до повного заряду. Кнопка «🔄 Оновити» бере свіжі дані.\n\n"
+    "✏️ <b>Назва</b> — кнопка під станом (або /rename). Можна назвати станцію зручно, наприклад «Дача». "
+    "Нову назву бачиш тільки ти.\n\n"
+    "⏰ <b>Розклад</b> — бот сам надсилатиме стан у потрібний час або кожні кілька хвилин. "
+    "Натискай на час, щоб увімкнути чи вимкнути його. Свій час: /schedule 08:30\n\n"
+    "🔔 <b>Сповіщення</b> — що бот пише сам: світло з'явилося чи зникло, низький і повний заряд, "
+    "помилки станції, немає зв'язку."
+)
+HELP_ADMIN = (
+    "\n\n👥 <b>Користувачі</b> — хто має доступ і до яких станцій; тут можна змінити роль чи видалити людину.\n\n"
+    "➕ /invite — запросити людину: обираєш роль і станції та отримуєш посилання.\n"
+    "• <b>Власник</b> — керує обраними станціями.\n"
+    "• <b>Гість</b> — лише дивиться."
+)
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not allowed(update):
+        return
+    text = HELP_COMMON + (HELP_ADMIN if is_admin(update) else "")
+    await update.message.reply_text(text, parse_mode="HTML")
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -352,10 +388,11 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not devs:
         await update.message.reply_text("У тебе поки немає доступу до жодної станції. Попроси адміна.")
     elif len(devs) == 1:
-        await update.message.reply_text(status_text(devs[0]), parse_mode="HTML", reply_markup=status_kb(devs[0]))
+        await update.message.reply_text(status_text(devs[0], update.effective_chat.id), parse_mode="HTML",
+                                        reply_markup=status_kb(devs[0]))
     else:
         await update.message.reply_text("Яка станція?", reply_markup=InlineKeyboardMarkup(
-            [[B(STORE.device_name(d), callback_data=f"dev:status:{d}")] for d in devs]))
+            [[B(STORE.label(update.effective_chat.id, d), callback_data=f"dev:status:{d}")] for d in devs]))
 
 
 async def cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -447,21 +484,72 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     for dev_id, info in STORE.devices().items():
         base = info["topic_base"]
         raw = state_of(dev_id).raw_snapshot()
+        bridge = state_of(dev_id).meta.get("name", "не отримано")
+        head = f"[{STORE.full_name(dev_id)}] id={dev_id}, назва від моста: {bridge}"
         if not raw:
-            chunks.append(f"[{info['name']}] MQTT-повідомлень не отримано.\nБрокер: {MQTT_HOST}:{MQTT_PORT}\nТопік: {base}/#")
+            chunks.append(f"{head}\nMQTT-повідомлень не отримано.\nБрокер: {MQTT_HOST}:{MQTT_PORT}\nТопік: {base}/#")
             continue
         lines = [f"{t.removeprefix(base + '/')} = {v[:60]}" for t, v in sorted(raw.items())]
-        chunks.append(f"[{info['name']}]\n" + "\n".join(lines))
+        chunks.append(f"{head}\n" + "\n".join(lines))
     text = "\n\n".join(chunks)
     for i in range(0, len(text), 3800):
         await update.message.reply_text(text[i:i + 3800])
+
+
+# ---------------------------------------------------------------- особиста назва станції
+def rename_prompt(chat_id: int, dev_id: str) -> str:
+    return (
+        f"✏️ Як називати станцію <b>{esc(STORE.device_name(dev_id))}</b>?\n\n"
+        "Напиши нову назву (до 40 символів). Її бачитимеш тільки ти.\n"
+        "Щоб повернути стандартну назву — надішли «-»."
+    )
+
+
+async def cmd_rename(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not allowed(update):
+        return
+    chat_id = update.effective_chat.id
+    devs = STORE.devices_for(chat_id)
+    if not devs:
+        await update.message.reply_text("У тебе поки немає доступу до жодної станції.")
+    elif len(devs) == 1:
+        context.user_data["rename"] = devs[0]
+        await update.message.reply_text(rename_prompt(chat_id, devs[0]), parse_mode="HTML")
+    else:
+        await update.message.reply_text("Яку станцію назвати?", reply_markup=InlineKeyboardMarkup(
+            [[B(STORE.label(chat_id, d), callback_data=f"ren:{d}")] for d in devs]))
+
+
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Звичайний текст: приймаємо лише якщо чекаємо нову назву станції."""
+    if not allowed(update):
+        return
+    dev_id = context.user_data.get("rename")
+    if not dev_id:
+        return
+    chat_id = update.effective_chat.id
+    if not STORE.role(chat_id, dev_id):
+        context.user_data.pop("rename", None)
+        return
+    text = " ".join((update.message.text or "").split())   # прибираємо переноси й зайві пробіли
+    if text in ("-", "—"):
+        STORE.set_alias(chat_id, dev_id, None)
+        reply = f"↩️ Повернув стандартну назву: <b>{esc(STORE.label(chat_id, dev_id))}</b>"
+    elif 0 < len(text) <= 40:
+        STORE.set_alias(chat_id, dev_id, text)
+        reply = f"✅ Готово! Тепер станція називається <b>{esc(text)}</b>."
+    else:
+        await update.message.reply_text("Назва має бути від 1 до 40 символів. Спробуй ще раз або надішли «-».")
+        return
+    context.user_data.pop("rename", None)
+    await update.message.reply_text(reply, parse_mode="HTML")
 
 
 # ---------------------------------------------------------------- запрошення та користувачі (адмін)
 def invite_view(inv: dict) -> tuple[str, InlineKeyboardMarkup]:
     devs = STORE.devices()
     chosen = [d for d in devs if d in inv["devs"]]
-    names = ", ".join(esc(devs[d]["name"]) for d in chosen) or "не обрано"
+    names = ", ".join(esc(STORE.full_name(d)) for d in chosen) or "не обрано"
     text = (
         "➕ <b>Нове запрошення</b>\n\n"
         f"Роль: <b>{ROLE_TITLES[inv['role']]}</b>\n"
@@ -472,7 +560,7 @@ def invite_view(inv: dict) -> tuple[str, InlineKeyboardMarkup]:
     rows = [[B(("● " if inv["role"] == r else "") + ROLE_TITLES[r], callback_data=f"inv:role:{r}")
              for r in (ROLE_GUEST, ROLE_OWNER)]]
     for d, info in devs.items():
-        rows.append([B(("✅ " if d in inv["devs"] else "⬜ ") + info["name"], callback_data=f"inv:dev:{d}")])
+        rows.append([B(("✅ " if d in inv["devs"] else "⬜ ") + STORE.full_name(d), callback_data=f"inv:dev:{d}")])
     rows.append([B("🔗 Створити посилання", callback_data="inv:make")])
     return text, InlineKeyboardMarkup(rows)
 
@@ -493,7 +581,7 @@ def users_view() -> tuple[str, InlineKeyboardMarkup]:
     rows = []
     for cid, u in users:
         title = u.get("name") or str(cid)
-        lines.append(f"• {esc(title)} — {role_summary(cid)}")
+        lines.append(f"• {esc(title)} — {role_summary(cid, full=True)}")
         rows.append([B(f"👤 {title}", callback_data=f"usr:open:{cid}")])
     lines.append("\nНатисни на людину, щоб змінити доступ. Нових людей додає /invite.")
     return "\n".join(lines), InlineKeyboardMarkup(rows)
@@ -511,7 +599,7 @@ def user_card(cid: int) -> tuple[str, InlineKeyboardMarkup]:
         for d, info in STORE.devices().items():
             r = STORE.role(cid, d)
             label = ROLE_TITLES[r] if r else "—"
-            rows.append([B(f"{info['name']}: {label}", callback_data=f"usr:cyc:{cid}:{d}")])
+            rows.append([B(f"{STORE.full_name(d)}: {label}", callback_data=f"usr:cyc:{cid}:{d}")])
         rows.append([B("🗑 Видалити користувача", callback_data=f"usr:del:{cid}")])
     rows.append([B("⬅️ Назад", callback_data="usr:list")])
     return text, InlineKeyboardMarkup(rows)
@@ -570,6 +658,7 @@ async def on_menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not allowed(update):
         return
     text = update.message.text
+    context.user_data.pop("rename", None)      # натиснув кнопку меню — вводити назву вже не чекаємо
     if text == BTN_STATUS:
         await cmd_status(update, context)
     elif text == BTN_SCHEDULE:
@@ -577,7 +666,7 @@ async def on_menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     elif text == BTN_ALERTS:
         await cmd_alerts(update, context)
     elif text == BTN_HELP:
-        await cmd_start(update, context)
+        await cmd_help(update, context)
     elif text == BTN_USERS:
         await cmd_users(update, context)
 
@@ -600,7 +689,19 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 await query.answer("⛔ Немає доступу до цієї станції")
                 return
             await query.answer("Оновлено")
-            await query.edit_message_text(status_text(dev_id), parse_mode="HTML", reply_markup=status_kb(dev_id))
+            await query.edit_message_text(status_text(dev_id, chat_id), parse_mode="HTML",
+                                          reply_markup=status_kb(dev_id))
+            return
+
+        # --- особиста назва станції
+        if data.startswith("ren:"):
+            dev_id = data.split(":", 1)[1]
+            if not STORE.role(chat_id, dev_id):
+                await query.answer("⛔ Немає доступу до цієї станції")
+                return
+            context.user_data["rename"] = dev_id
+            await query.answer()
+            await query.message.reply_text(rename_prompt(chat_id, dev_id), parse_mode="HTML")
             return
 
         # --- розклад
@@ -767,10 +868,11 @@ async def check_alerts(context: ContextTypes.DEFAULT_TYPE) -> None:
         msgs = collect_alerts(app, dev_id)
         if not msgs:
             continue
-        text = "\n".join(msgs)
-        if len(devices) > 1:   # кілька станцій — підписуємо, про яку мова
-            text = f"<b>{esc(info['name'])}</b>\n{text}"
+        body = "\n".join(msgs)
         for chat_id in STORE.users_for_device(dev_id):
+            text = body
+            if len(STORE.devices_for(chat_id)) > 1:   # у людини кілька станцій — підписуємо, про яку мова
+                text = f"<b>{esc(STORE.label(chat_id, dev_id))}</b>\n{body}"
             try:
                 await app.bot.send_message(chat_id, text, parse_mode="HTML")
             except Exception as e:  # noqa: BLE001
@@ -801,7 +903,11 @@ def start_mqtt() -> mqtt.Client:
     def on_message(c, userdata, msg):
         found = device_for_topic(msg.topic)
         if found:
-            state_of(found[0]).update(msg.topic, msg.payload, found[1])
+            state = state_of(found[0])
+            state.update(msg.topic, msg.payload, found[1])
+            name = state.meta.get("name")
+            if name and STORE.update_device_name(found[0], name):
+                log.info("Назва станції %s від моста: %s", found[0], name)
 
     client.on_connect = on_connect
     client.on_message = on_message
@@ -831,6 +937,8 @@ def bootstrap_store() -> Store:
 async def post_init(app: Application) -> None:
     await app.bot.set_my_commands([
         BotCommand("status", "Поточний стан станції"),
+        BotCommand("rename", "Назвати станцію по-своєму"),
+        BotCommand("help", "Інструкція"),
         BotCommand("schedule", "Щоденний звіт: /schedule 08:00"),
         BotCommand("every", "Звіт кожні N хв: /every 60"),
         BotCommand("schedules", "Мій розклад"),
@@ -850,19 +958,22 @@ def main() -> None:
     STORE = bootstrap_store()
     start_mqtt()
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
-    app.add_handler(CommandHandler(["start", "help"], cmd_start))
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("schedule", cmd_schedule))
     app.add_handler(CommandHandler("every", cmd_every))
     app.add_handler(CommandHandler("schedules", cmd_schedules))
     app.add_handler(CommandHandler("clear", cmd_clear))
     app.add_handler(CommandHandler("alerts", cmd_alerts))
+    app.add_handler(CommandHandler("rename", cmd_rename))
     app.add_handler(CommandHandler("invite", cmd_invite))
     app.add_handler(CommandHandler("users", cmd_users))
     app.add_handler(CommandHandler("debug", cmd_debug))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(
         filters.Text([BTN_STATUS, BTN_SCHEDULE, BTN_ALERTS, BTN_HELP, BTN_USERS]), on_menu_text))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     log.info("Бот запущено")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 

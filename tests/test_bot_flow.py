@@ -25,7 +25,8 @@ S = bot.STORE
 
 def make_update(chat_id, text="", args=None, data=None):
     msg = SimpleNamespace(text=text, reply_text=AsyncMock())
-    q = SimpleNamespace(data=data, answer=AsyncMock(), edit_message_text=AsyncMock()) if data else None
+    q = SimpleNamespace(data=data, answer=AsyncMock(), edit_message_text=AsyncMock(),
+                        message=SimpleNamespace(reply_text=AsyncMock())) if data else None
     upd = SimpleNamespace(effective_chat=SimpleNamespace(id=chat_id),
                           effective_user=SimpleNamespace(full_name=f"user{chat_id}"),
                           message=msg, callback_query=q)
@@ -145,6 +146,64 @@ def test_alert_recipients_and_prefix():
     sent = [(c[0][0], c[0][1]) for c in app.bot.send_message.call_args_list]
     assert any(cid == 1 and "Мама" in t for cid, t in sent)              # админ получил с подписью станции
     assert not any(cid == 555 for cid, _ in sent)                        # у 555 доступа к mama уже нет
+
+
+def test_start_and_help_texts():
+    upd, ctx = make_update(1)
+    run(bot.cmd_start(upd, ctx))
+    t = said(upd)
+    assert "Я стежу за домашніми девайсами" in t and "Твій доступ" in t and "/help" in t
+    assert "chat_id" not in t and "/debug" not in t                 # технічного нема
+    upd, ctx = make_update(1)
+    run(bot.cmd_help(upd, ctx))
+    assert "/invite" in said(upd) and "/debug" not in said(upd)
+    upd, ctx = make_update(555)
+    run(bot.cmd_help(upd, ctx))
+    assert "/invite" not in said(upd) and "Інструкція" in said(upd)
+
+
+def test_bridge_name_and_index():
+    assert S.devices()["main"]["index"] == 1 and S.devices()["mama"]["index"] == 2
+    st = bot.StationState()
+    cfg = json.dumps({"name": "Battery", "device": {"name": "Oukitel P2001E Plus", "model": "P2001"}})
+    st.update("homeassistant/sensor/oukitel/battery/config", cfg.encode(), "homeassistant/sensor/oukitel")
+    assert st.meta["name"] == "Oukitel P2001E Plus" and st.snapshot()[0] == {}   # у значення не потрапляє
+    assert S.update_device_name("main", "Oukitel P2001") is True
+    assert S.update_device_name("main", "Oukitel P2001") is False                # без змін — не пишемо
+    assert S.full_name("main") == "Oukitel P2001 №1"
+
+
+def test_alias_duplicates_and_rename_flow():
+    S.add_device("dacha", "Oukitel P2001", "homeassistant/sensor/oukitel_dacha")      # така сама назва
+    S.set_access(555, "main", "guest"); S.set_access(555, "dacha", "owner")
+    assert S.label(555, "main") == "Oukitel P2001 №1" and S.label(555, "dacha") == "Oukitel P2001 №3"
+    # перейменування: кнопка -> текст
+    upd, ctx = make_update(555, data="ren:dacha")
+    run(bot.on_button(upd, ctx))
+    assert ctx.user_data["rename"] == "dacha"
+    upd2, _ = make_update(555, "Дача <b>")
+    run(bot.on_text(upd2, ctx))
+    assert S.label(555, "dacha") == "Дача <b>" and "rename" not in ctx.user_data
+    assert "&lt;b&gt;" in said(upd2)                                               # html екранується
+    assert S.label(1, "dacha") == "Oukitel P2001 №3"                               # у інших — без змін
+    # статус показує особисту назву
+    upd3, ctx3 = make_update(555, data="status:refresh:dacha")
+    run(bot.on_button(upd3, ctx3))
+    assert "Дача" in edited(upd3)
+    # скидання і занадто довга назва
+    ctx.user_data["rename"] = "dacha"
+    run(bot.on_text(make_update(555, "x" * 41)[0], ctx))
+    assert S.alias(555, "dacha") == "Дача <b>"
+    run(bot.on_text(make_update(555, "-")[0], ctx))
+    assert S.alias(555, "dacha") is None
+    # чужий текст без очікування — ігнорується
+    upd4, ctx4 = make_update(555, "привіт")
+    run(bot.on_text(upd4, ctx4))
+    upd4.message.reply_text.assert_not_called()
+    # чужа станція не перейменовується
+    upd5, ctx5 = make_update(555, data="ren:nonexistent")
+    run(bot.on_button(upd5, ctx5))
+    assert "rename" not in ctx5.user_data
 
 
 if __name__ == "__main__":
