@@ -54,7 +54,7 @@ MQTT_TOPIC_BASE = os.getenv("MQTT_TOPIC_BASE", "homeassistant/sensor/oukitel").r
 
 FULL_BATTERY = float(os.getenv("ALERT_FULL_BATTERY", "100"))
 GRID_MIN_W = float(os.getenv("GRID_MIN_W", "5"))      # вхід з мережі від цієї потужності точно означає «мережа є»
-GRID_LOAD_W = 10.0                                    # навантаження від цієї потужності при нульовому вході = «працюємо від батареї»
+GRID_DROP_PCT = float(os.getenv("GRID_DROP_PCT", "5"))  # вхід нульовий і заряд нижчий за ліміт на стільки % = світла немає
 INPUT_DEBOUNCE_S = int(os.getenv("ALERT_INPUT_DEBOUNCE_S", "60"))
 STALE_AFTER_S = int(os.getenv("STALE_AFTER_S", "300"))
 
@@ -249,20 +249,21 @@ def grid_watts(values: dict) -> float | None:
 
 def grid_signal(values: dict) -> str | None:
     """Що можна сказати про мережу за поточними показниками станції:
-    'on' — точно є, 'off' — точно немає, 'idle' — заряджена й нічого не живить (за потужністю не відрізнити),
-    None — даних немає. Прапорця «є мережа» мост не віддає, тому міркуємо за потужністю."""
+    'on' — точно є, 'off' — точно немає, 'idle' — за потужністю не відрізнити, None — даних немає.
+    Прапорця «є мережа» (і режиму ДБЖ) станція не віддає, тому міркуємо так:
+      • вхід з мережі ≥ GRID_MIN_W → мережа є;
+      • входу немає, а заряд помітно нижчий за ліміт зарядки → мережа зникла (інакше станція вже заряджалась би);
+      • входу немає, але заряд майже повний → 'idle'. Це може бути й «дозарядка» в режимі ДБЖ: станція на 100% живить
+        навантаження від батареї, поки не просяде на 1–2%, і лише потім знову заряджається, хоча мережа є."""
     grid = grid_watts(values)
     if grid is None:
         return None
     if grid >= GRID_MIN_W:
         return "on"
-    tout = num(values, "output_watts", "total_output_power", "output_power")
-    if tout is not None and tout >= GRID_LOAD_W:
-        return "off"          # споживаємо, а входу немає: при живій мережі вхід був би не меншим за навантаження
     bat = num(values, "battery", "battery_level", "soc")
     limit = num(values, "ac_charging_limit") or 100.0
-    if bat is not None and bat < limit - 10:
-        return "off"          # при живій мережі станція вже заряджалась би
+    if bat is not None and bat <= limit - GRID_DROP_PCT:
+        return "off"
     return "idle"
 
 
@@ -1238,6 +1239,9 @@ def device_events(app: Application, dev_id: str) -> list[tuple[str, dict]]:
                 st.pop("grid_change_since", None)
                 tout = num(values, "output_watts", "total_output_power", "output_power")
                 remain = num(values, "remain_time", "remaining_discharge_time")
+                log.info("Світло %s на %s: заряд=%s вхід(AC)=%s вхід(усього)=%s вихід=%s ліміт=%s", "з'явилося" if on else "зникло",
+                         dev_id, bat, num(values, "ac_input_watts"), num(values, "input_watts"), tout,
+                         num(values, "ac_charging_limit"))
                 if on:
                     began = st.pop("off_since", None)
                     events.append(("light_on", {"bat": bat, "outage_s": now - began if began else None}))
