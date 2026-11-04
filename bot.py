@@ -75,12 +75,9 @@ class StationState:
         self.values: dict[str, object] = {}
         self.raw: dict[str, str] = {}
         self.updated: float = 0.0
-        self.meta: dict[str, str] = {}      # дані про пристрій від моста (назва, модель)
+        self.meta: dict[str, str] = {}      # що міст повідомив про пристрій: name, model, serial
 
     def update(self, topic: str, payload: bytes, base: str) -> None:
-        if topic.rstrip("/").endswith("/config"):
-            self._read_discovery(payload)       # опис пристрою, який міст публікує для Home Assistant
-            return
         key = topic_to_key(topic, base)
         if key is None:
             return
@@ -95,18 +92,6 @@ class StationState:
             else:
                 self.values[key] = value
             self.updated = time.time()
-
-    def _read_discovery(self, payload: bytes) -> None:
-        try:
-            info = json.loads(payload.decode("utf-8", errors="replace")).get("device", {})
-        except (json.JSONDecodeError, AttributeError):
-            return
-        if not isinstance(info, dict):
-            return
-        with self._lock:
-            for field in ("name", "model", "manufacturer"):
-                if isinstance(info.get(field), str) and info[field].strip():
-                    self.meta[field] = info[field].strip()
 
     def snapshot(self) -> tuple[dict, float]:
         with self._lock:
@@ -145,7 +130,25 @@ def parse_value(text: str):
 
 
 # Стан кожного пристрою окремо: {"main": StationState, ...}
+def parse_device_info(cfg: dict) -> dict[str, str]:
+    """З опису сенсора (Home Assistant discovery) дістає назву, модель і серійний номер станції."""
+    dev = cfg.get("device")
+    if not isinstance(dev, dict):
+        return {}
+    info = {}
+    for field, key in (("name", "name"), ("model", "model"), ("serial", "serial_number")):
+        val = dev.get(key)
+        if isinstance(val, str) and val.strip():
+            info[field] = val.strip()
+    if "serial" not in info:                      # запасний варіант — MAC із connections
+        for conn in dev.get("connections") or []:
+            if isinstance(conn, list) and len(conn) == 2 and conn[0] == "mac":
+                info["serial"] = str(conn[1])
+    return info
+
+
 STATES: dict[str, StationState] = {}
+ADMIN_NOTICES: list[str] = []       # повідомлення для адмінів від MQTT-потоку; розсилає check_alerts
 STORE: Store = None  # type: ignore[assignment]  # створюється в main()
 
 
@@ -485,7 +488,9 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         base = info["topic_base"]
         raw = state_of(dev_id).raw_snapshot()
         bridge = state_of(dev_id).meta.get("name", "не отримано")
-        head = f"[{STORE.full_name(dev_id)}] id={dev_id}, назва від моста: {bridge}"
+        meta = state_of(dev_id).meta
+        head = (f"[{STORE.full_name(dev_id)}] id={dev_id}, назва від моста: {bridge}, "
+                f"модель: {meta.get('model', '—')}, серійний: {meta.get('serial', '—')}")
         if not raw:
             chunks.append(f"{head}\nMQTT-повідомлень не отримано.\nБрокер: {MQTT_HOST}:{MQTT_PORT}\nТопік: {base}/#")
             continue
@@ -863,6 +868,14 @@ def collect_alerts(app: Application, dev_id: str) -> list[str]:
 
 async def check_alerts(context: ContextTypes.DEFAULT_TYPE) -> None:
     app = context.application
+    while ADMIN_NOTICES:                       # службові повідомлення для адмінів
+        notice = ADMIN_NOTICES.pop(0)
+        for cid, user in STORE.all_users():
+            if user.get("admin"):
+                try:
+                    await app.bot.send_message(cid, notice, parse_mode="HTML")
+                except Exception as e:  # noqa: BLE001
+                    log.warning("Не вдалося надіслати в %s: %s", cid, e)
     devices = STORE.devices()
     for dev_id, info in devices.items():
         msgs = collect_alerts(app, dev_id)
@@ -890,24 +903,59 @@ def device_for_topic(topic: str) -> tuple[str, str] | None:
     return best
 
 
+def handle_discovery(payload: bytes) -> None:
+    """Опис сенсора від моста → назва та серійний номер станції. До станції прив'язуємо за її топіком."""
+    try:
+        cfg = json.loads(payload.decode("utf-8", errors="replace"))
+    except json.JSONDecodeError:
+        return
+    if not isinstance(cfg, dict):
+        return
+    found = None
+    for key in ("state_topic", "command_topic", "availability_topic"):
+        if isinstance(cfg.get(key), str):
+            found = device_for_topic(cfg[key])
+            if found:
+                break
+    info = parse_device_info(cfg)
+    if not found or not info:
+        return
+    dev_id = found[0]
+    state_of(dev_id).meta.update(info)
+    res = STORE.update_device_info(dev_id, info.get("name"), info.get("serial"))
+    if res["name_changed"]:
+        log.info("Назва станції %s від моста: %s", dev_id, info.get("name"))
+    if res["old_serial"]:
+        log.warning("Серійний номер станції %s змінився: %s -> %s", dev_id, res["old_serial"], info.get("serial"))
+        ADMIN_NOTICES.append(
+            f"⚠️ Станція <b>{esc(STORE.full_name(dev_id))}</b> тепер повідомляє інший серійний номер "
+            f"(було <code>{esc(res['old_serial'])}</code>, стало <code>{esc(info.get('serial'))}</code>). "
+            "Можливо, міст підключився до іншого пристрою акаунта — перевір."
+        )
+
+
 def start_mqtt() -> mqtt.Client:
     client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="oukitel-telegram-bot")
     if MQTT_USER:
         client.username_pw_set(MQTT_USER, MQTT_PASSWORD)
 
     def on_connect(c, userdata, flags, reason_code, properties):
+        prefixes = set()
         for dev_id, info in STORE.devices().items():
             log.info("MQTT підключено (%s), підписка на %s/# (%s)", reason_code, info["topic_base"], dev_id)
             c.subscribe(f"{info['topic_base']}/#")
+            prefixes.add(info["topic_base"].split("/")[0])
+        for prefix in prefixes:     # описи пристроїв міст кладе окремо: <prefix>/sensor/oukitel_battery/config
+            c.subscribe(f"{prefix}/+/+/config")
 
     def on_message(c, userdata, msg):
+        if msg.topic.endswith("/config"):
+            handle_discovery(msg.payload)
+            return
         found = device_for_topic(msg.topic)
         if found:
             state = state_of(found[0])
             state.update(msg.topic, msg.payload, found[1])
-            name = state.meta.get("name")
-            if name and STORE.update_device_name(found[0], name):
-                log.info("Назва станції %s від моста: %s", found[0], name)
 
     client.on_connect = on_connect
     client.on_message = on_message

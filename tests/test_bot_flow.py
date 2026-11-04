@@ -164,12 +164,30 @@ def test_start_and_help_texts():
 
 def test_bridge_name_and_index():
     assert S.devices()["main"]["index"] == 1 and S.devices()["mama"]["index"] == 2
-    st = bot.StationState()
-    cfg = json.dumps({"name": "Battery", "device": {"name": "Oukitel P2001E Plus", "model": "P2001"}})
-    st.update("homeassistant/sensor/oukitel/battery/config", cfg.encode(), "homeassistant/sensor/oukitel")
-    assert st.meta["name"] == "Oukitel P2001E Plus" and st.snapshot()[0] == {}   # у значення не потрапляє
-    assert S.update_device_name("main", "Oukitel P2001") is True
-    assert S.update_device_name("main", "Oukitel P2001") is False                # без змін — не пишемо
+    cfg = {"name": "Oukitel Battery", "state_topic": "homeassistant/sensor/oukitel/battery",
+           "device": {"name": "Oukitel P2001", "model": "P2001 Plus", "serial_number": "AA:BB:01",
+                      "connections": [["mac", "AA:BB:01"]]}}
+    bot.handle_discovery(json.dumps(cfg).encode())
+    assert bot.state_of("main").meta["name"] == "Oukitel P2001"
+    assert S.device_name("main") == "Oukitel P2001" and S.devices()["main"]["serial"] == "AA:BB:01"
+    assert not bot.ADMIN_NOTICES
+    # інша станція (інший топік) не плутається
+    other = dict(cfg, state_topic="homeassistant/sensor/oukitel_mama/battery",
+                 device={"name": "Oukitel P5000", "serial_number": "CC:DD:02"})
+    bot.handle_discovery(json.dumps(other).encode())
+    assert S.device_name("mama") == "Oukitel P5000" and S.device_name("main") == "Oukitel P2001"
+    # чужий топік і сміття ігноруються
+    bot.handle_discovery(json.dumps(dict(cfg, state_topic="other/topic")).encode())
+    bot.handle_discovery(b"not json")
+    # серійний змінився -> попередження адміну
+    swapped = dict(cfg, device={"name": "Oukitel P2001", "serial_number": "ZZ:99"})
+    bot.handle_discovery(json.dumps(swapped).encode())
+    assert len(bot.ADMIN_NOTICES) == 1 and "AA:BB:01" in bot.ADMIN_NOTICES[0]
+    app = MagicMock(); app.bot_data = {}; app.bot.send_message = AsyncMock()
+    run(bot.check_alerts(SimpleNamespace(application=app)))
+    assert not bot.ADMIN_NOTICES
+    assert any(c[0][0] == 1 and "серійний" in c[0][1] for c in app.bot.send_message.call_args_list)
+    S.update_device_info("main", "Oukitel P2001", "AA:BB:01")
     assert S.full_name("main") == "Oukitel P2001 №1"
 
 

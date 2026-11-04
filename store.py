@@ -85,15 +85,26 @@ class Store:
         """Справжня назва станції (її повідомляє міст). Однакова для всіх користувачів."""
         return self.data["devices"].get(dev_id, {}).get("name", dev_id)
 
-    def update_device_name(self, dev_id: str, name: str) -> bool:
-        """Оновлює назву, яку повідомив міст. Повертає True, якщо вона змінилася."""
+    def update_device_info(self, dev_id: str, name: str | None, serial: str | None) -> dict:
+        """Фіксує назву й серійний номер, які повідомив міст.
+        Повертає {'name_changed': bool, 'old_serial': str|None} — old_serial заповнений, лише якщо серійний ЗМІНИВСЯ."""
+        res = {"name_changed": False, "old_serial": None}
         with self._lock:
             dev = self.data["devices"].get(dev_id)
-            if dev is None or not name or dev.get("name") == name:
-                return False
-            dev["name"] = name
-            self.save()
-            return True
+            if dev is None:
+                return res
+            changed = False
+            if name and dev.get("name") != name:
+                dev["name"] = name
+                res["name_changed"] = changed = True
+            if serial and dev.get("serial") != serial:
+                if dev.get("serial"):
+                    res["old_serial"] = dev["serial"]
+                dev["serial"] = serial
+                changed = True
+            if changed:
+                self.save()
+        return res
 
     def full_name(self, dev_id: str) -> str:
         """'Oukitel P2001E Plus №2' — для адміна й для розрізнення однакових станцій."""
