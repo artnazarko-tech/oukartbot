@@ -55,7 +55,9 @@ MQTT_TOPIC_BASE = os.getenv("MQTT_TOPIC_BASE", "homeassistant/sensor/oukitel").r
 FULL_BATTERY = float(os.getenv("ALERT_FULL_BATTERY", "100"))
 FULL_REARM_PCT = float(os.getenv("FULL_REARM_PCT", "5"))    # «Станція заряджена» знову спрацює, лише коли заряд впаде на стільки %
 GRID_MIN_W = float(os.getenv("GRID_MIN_W", "5"))      # вхід з мережі від цієї потужності точно означає «мережа є»
-GRID_DROP_PCT = float(os.getenv("GRID_DROP_PCT", "5"))  # вхід нульовий і заряд нижчий за ліміт на стільки % = світла немає
+GRID_LOAD_W = 10.0                                    # навантаження від цієї потужності при нульовому вході = «живимось від батареї»
+GRID_DROP_PCT = float(os.getenv("GRID_DROP_PCT", "2"))  # вхід нульовий і заряд нижчий за ліміт на стільки % = світла немає (навіть без навантаження)
+GRID_OFF_DEBOUNCE_S = int(os.getenv("GRID_OFF_DEBOUNCE_S", "120"))   # скільки секунд ознаки відключення мають тривати, щоб надіслати «Світло зникло»
 INPUT_DEBOUNCE_S = int(os.getenv("ALERT_INPUT_DEBOUNCE_S", "60"))
 STALE_AFTER_S = int(os.getenv("STALE_AFTER_S", "300"))
 
@@ -256,17 +258,20 @@ def grid_watts(values: dict) -> float | None:
 
 def grid_signal(values: dict) -> str | None:
     """Що можна сказати про мережу за поточними показниками станції:
-    'on' — точно є, 'off' — точно немає, 'idle' — за потужністю не відрізнити, None — даних немає.
-    Прапорця «є мережа» (і режиму ДБЖ) станція не віддає, тому міркуємо так:
-      • вхід з мережі ≥ GRID_MIN_W → мережа є;
-      • входу немає, а заряд помітно нижчий за ліміт зарядки → мережа зникла (інакше станція вже заряджалась би);
-      • входу немає, але заряд майже повний → 'idle'. Це може бути й «дозарядка» в режимі ДБЖ: станція на 100% живить
-        навантаження від батареї, поки не просяде на 1–2%, і лише потім знову заряджається, хоча мережа є."""
+    'on' — точно є, 'off' — немає, 'idle' — за потужністю не відрізнити, None — даних немає.
+    Прапорця «є мережа» і режиму ДБЖ станція не віддає, тому міркуємо за потужністю й зарядом:
+      • вхід з мережі ≥ GRID_MIN_W → мережа є (на 100% станція пропускає мережу на навантаження: вхід = навантаженню);
+      • входу немає, а навантаження є → живимось від батареї, мережі немає;
+      • входу й навантаження немає, але заряд просів нижче ліміту зарядки → мережі немає (інакше станція тримала б заряд);
+      • входу й навантаження немає, заряд повний → 'idle': за потужністю не відрізнити, лишається останній відомий стан."""
     grid = grid_watts(values)
     if grid is None:
         return None
     if grid >= GRID_MIN_W:
         return "on"
+    tout = num(values, "output_watts", "total_output_power", "output_power")
+    if tout is not None and tout >= GRID_LOAD_W:
+        return "off"
     bat = num(values, "battery", "battery_level", "soc")
     limit = num(values, "ac_charging_limit") or 100.0
     if bat is not None and bat <= limit - GRID_DROP_PCT:
@@ -1243,7 +1248,7 @@ def device_events(app: Application, dev_id: str) -> list[tuple[str, dict]]:
             st["grid_on"] = on
         elif on != st["grid_on"]:
             since = st.setdefault("grid_change_since", now)
-            if now - since >= INPUT_DEBOUNCE_S:       # затримка, щоб не реагувати на короткі стрибки
+            if now - since >= (INPUT_DEBOUNCE_S if on else GRID_OFF_DEBOUNCE_S):   # затримка проти коротких провалів
                 st["grid_on"] = on
                 st.pop("grid_change_since", None)
                 tout = num(values, "output_watts", "total_output_power", "output_power")

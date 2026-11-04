@@ -321,21 +321,21 @@ def test_grid_detection_without_input_power():
     assert g({}) is None
     assert g({"ac_input_watts": 450, "output_watts": 120, "battery": 60}) == "on"
     assert g({"ac_input_watts": 20, "output_watts": 20, "battery": 100}) == "on"            # прохідне живлення з малим навантаженням
-    # режим ДБЖ: на 100% станція живить навантаження від батареї, хоча мережа є — це НЕ відключення
-    assert g({"ac_input_watts": 0, "output_watts": 120, "battery": 100}) == "idle"
-    assert g({"ac_input_watts": 0, "output_watts": 300, "battery": 98}) == "idle"
+    # навантаження є, входу немає — живимось від батареї, навіть якщо заряд 98–100%
+    assert g({"ac_input_watts": 0, "output_watts": 120, "battery": 100}) == "off"
+    assert g({"ac_input_watts": 0, "output_watts": 300, "battery": 98}) == "off"
+    # нічого не підключено: відключення видно за просадкою заряду нижче ліміту
     assert g({"ac_input_watts": 0, "output_watts": 0, "battery": 100, "ac_charging_limit": 100}) == "idle"   # скриншот: 100%, простій
-    # заряд просів нижче ліміту на 5% і входу немає — мережі справді нема
-    assert g({"ac_input_watts": 0, "output_watts": 120, "battery": 95}) == "off"
+    assert g({"ac_input_watts": 0, "output_watts": 0, "battery": 99}) == "idle"
+    assert g({"ac_input_watts": 0, "output_watts": 0, "battery": 98}) == "off"
     assert g({"ac_input_watts": 0, "output_watts": 0, "battery": 60, "ac_charging_limit": 100}) == "off"
-    assert g({"ac_input_watts": 0, "output_watts": 0, "battery": 96}) == "idle"
     assert g({"ac_input_watts": 0, "output_watts": 0, "battery": 80, "ac_charging_limit": 80}) == "idle"   # досягла свого ліміту
-    assert g({"ac_input_watts": 0, "output_watts": 50, "battery": 75, "ac_charging_limit": 80}) == "off"
+    assert g({"ac_input_watts": 0, "output_watts": 0, "battery": 77, "ac_charging_limit": 80}) == "off"
     assert g({"input_watts": 300, "battery": 50}) == "on"                                   # немає ac_input_watts — беремо загальний вхід
     # реальні показники станції: прохідне живлення — ac_input_watts=0, але загальний вхід = навантаження
     real = {"ac_input_watts": 0, "input_watts": 231, "output_watts": 231, "dc_input_watts": 0, "battery": 100, "ac_charging_limit": 100}
     assert bot.grid_watts(real) == 231 and g(real) == "on"
-    assert g(dict(real, input_watts=231, dc_input_watts=231)) == "idle"                     # весь вхід — сонце, мережі нема
+    assert g(dict(real, input_watts=231, dc_input_watts=231)) == "off"                      # весь вхід — сонце, мережі нема
     assert bot.grid_watts({"ac_input_watts": 40, "input_watts": 340, "dc_input_watts": 300}) == 40
     assert bot.grid_watts({"ac_input_watts": 0, "input_watts": 100, "dc_input_watts": 300}) == 0   # не буває від'ємної
     # пам'ять: простій не змінює останній відомий стан
@@ -349,11 +349,11 @@ def test_grid_detection_without_input_power():
     assert st.grid_status() == (True, True)
     st.update(f"{base}/ac_input_watts", b"0", base)          # зарядилась, простоює
     assert st.grid_status() == (True, False)                 # пам'ятаємо, що мережа була
-    st.update(f"{base}/output_watts", b"80", base)           # дозарядка ДБЖ: нагрузка від батареї на 100% — мережа все ще "є"
-    assert st.grid_status() == (True, False)
-    st.update(f"{base}/battery", b"90", base)                # заряд просів нижче ліміту, а входу немає — світла нема
+    st.update(f"{base}/output_watts", b"80", base)           # з'явилося навантаження, а входу немає — живимось від батареї
     assert st.grid_status() == (False, True)
-    st.update(f"{base}/output_watts", b"0", base)            # навантаження зникло — все ще "немає"
+    st.update(f"{base}/output_watts", b"0", base)            # навантаження зникло, заряд 100% — тримаємо "немає", але неточно
+    assert st.grid_status() == (False, False)
+    st.update(f"{base}/battery", b"90", base)                # заряд просів нижче ліміту, входу немає — точно "немає"
     assert st.grid_status() == (False, True)
 
 
@@ -364,7 +364,7 @@ def test_grid_text_and_alerts_with_idle():
     assert "ймовірно" in bot.format_detail(idle, time.time(), "X")
     assert "Мережа: ✅ є\n" in bot.format_status(dict(idle, ac_input_watts=30), time.time(), "X")
     # сповіщення: простій не вважається відключенням
-    bot.INPUT_DEBOUNCE_S = 0
+    bot.INPUT_DEBOUNCE_S = 0; bot.GRID_OFF_DEBOUNCE_S = 0
     app = MagicMock(); app.bot_data = {}
     st = bot.state_of("dacha"); st.values = {}; st.updated = 0
     base = "homeassistant/sensor/oukitel_dacha"
@@ -375,9 +375,7 @@ def test_grid_text_and_alerts_with_idle():
     feed(battery=100, ac_input_watts=0, output_watts=0)
     assert not {"light_on", "light_off"} & set(kinds())                              # простій: тихо
     assert app.bot_data["alert_state"]["dacha"]["grid_on"] is True                   # базова лінія: мережа є
-    feed(output_watts=60)                                                            # навантаження без входу, батарея 100% — ДБЖ, не відключення
-    assert "light_off" not in kinds()
-    feed(battery=94)                                                                 # заряд просів нижче ліміту — світла справді немає
+    feed(output_watts=60)                                                            # навантаження є, входу немає — живимось від батареї
     assert "light_off" in kinds()
     feed(output_watts=0)                                                             # знову простій — повторів нема
     assert not {"light_on", "light_off"} & set(kinds())
@@ -423,7 +421,7 @@ def test_event_fanout_antispam_and_per_user_low():
     S.set_notify(555, "t1", "full", True)
     S.set_notify(555, "t1", "low", True); S.set_notify(555, "t1", "low_level", 15)
     S.set_notify(1, "t1", "low_level", 30)
-    bot.INPUT_DEBOUNCE_S = 0
+    bot.INPUT_DEBOUNCE_S = 0; bot.GRID_OFF_DEBOUNCE_S = 0
     app = MagicMock(); app.bot_data = {}; app.bot.send_message = AsyncMock()
     ctx = SimpleNamespace(application=app)
     base = "homeassistant/sensor/t1"
@@ -439,15 +437,14 @@ def test_event_fanout_antispam_and_per_user_low():
     assert step(battery=80, ac_input_watts=300, output_watts=0, hardware_fault_status="Normal") == {}   # перше спостереження — тихо
     got = step(battery=100)
     assert "заряджено" in got[1] and "заряджено" in got[555]                         # обидва підписані на «заряджена»
-    assert step(battery=98) == {} and step(battery=100) == {}                        # цикли ДБЖ 98↔100 — без спаму
+    assert step(battery=98) == {} and step(battery=100) == {}                        # цикли 98↔100 — без спаму
     assert step(battery=94) == {}
     assert "заряджено" in step(battery=100)[1]                                       # впала до 94% → знову взведено
 
     # відключення світла: 555 про нього не просив
-    assert step(ac_input_watts=0, output_watts=100, remain_time=380) == {}          # ДБЖ-дозарядка на 100%: не відключення
-    got = step(battery=94)
+    got = step(ac_input_watts=0, output_watts=100, remain_time=380)                  # навантаження є, входу немає
     assert "Світло зникло" in got[1] and "6 год 20 хв" in got[1] and 555 not in got
-    assert step(battery=96) == {}                                                    # після відключення взводиться вже на 97%
+    assert step(battery=99) == {} and step(battery=96) == {}                         # після відключення «заряджена» взводиться на 97%
     app.bot_data["alert_state"]["t1"]["off_since"] = time.time() - 8100
     got = step(ac_input_watts=200, output_watts=0)
     assert "Світло з'явилося" in got[1] and "Світла не було 2 год 15 хв" in got[1]
