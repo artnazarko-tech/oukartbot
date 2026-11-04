@@ -7,6 +7,7 @@ import re
 import sys
 import tempfile
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -280,7 +281,7 @@ def test_menu_navigation():
     labels = [b.text for row in bot.menu_for(1).keyboard for b in row]
     assert labels[:4] == ["📊 Стан", "🎛 Керування", "🔔 Сповіщення", "📈 Статистика"] and "👥 Користувачі" in labels
     assert "👥 Користувачі" not in [b.text for row in bot.menu_for(555).keyboard for b in row]
-    for data, expect in (("m:main", "Головне меню"), ("m:control", "в розробці"), ("m:stats", "в розробці"),
+    for data, expect in (("m:main", "Головне меню"), ("m:control", "Керування"), ("m:stats", "Статистика"),
                          ("m:alerts", "Сповіщення"), ("sch:open", "Розклад звітів"), ("m:help", "Інструкція"),
                          ("m:users", "Користувачі"), ("sd:main", "детальний стан"), ("st:main", "Мережа")):
         upd, ctx = make_update(1, data=data)
@@ -302,7 +303,7 @@ def test_menu_navigation():
     upd, ctx = make_update(1, "📈 Статистика")
     ctx.user_data["rename"] = "main"
     run(bot.on_menu_text(upd, ctx))
-    assert "rename" not in ctx.user_data and "в розробці" in said(upd)
+    assert "rename" not in ctx.user_data and "Статистика" in said(upd)
     # старе меню (версія 1) ще працює
     upd, ctx = make_update(1, "⏰ Розклад")
     run(bot.on_menu_text(upd, ctx))
@@ -517,6 +518,159 @@ def test_alert_state_survives_restart():
     app3 = make_app(saved=STORE_DATA()["alert_state"])                               # ще один «перезапуск» на 100%
     run(bot.check_alerts(SimpleNamespace(application=app3)))
     assert not [t for _, t in _collect(app3) if "T2" in t]
+
+def _feed(dev, **kv):
+    base = S.devices()[dev]["topic_base"]
+    for k, v in kv.items():
+        bot.state_of(dev).update(f"{base}/{k}", str(v).encode(), base)
+
+
+def _check_ctx():
+    return SimpleNamespace(bot=SimpleNamespace(edit_message_text=AsyncMock(), send_message=AsyncMock()))
+
+
+def _click(chat_id, data, ctx=None):
+    upd, c = make_update(chat_id, data=data)
+    run(bot.on_button(upd, ctx or c))
+    return upd
+
+
+def test_control_flow():
+    bot.PENDING.clear()
+    bot.MQTT_CLIENT = MagicMock()
+    bot.MQTT_CLIENT.publish.return_value = SimpleNamespace(rc=0)
+    base = S.devices()["main"]["topic_base"]
+    _feed("main", availability="online", ac_switch="ON", dc_switch="OFF", usb_switch="OFF",
+          ac_charging_limit=100, output_watts=0, dc_output_power=0)
+    # гість бачить пояснення й не може командувати
+    S.add_user(777, "Гість")
+    S.set_access(777, "main", "guest")
+    upd, ctx = make_update(777, "🎛 Керування")
+    run(bot.on_menu_text(upd, ctx))
+    assert "Гість" in said(upd)
+    u = _click(777, "cx:main:dc_switch:ON")
+    u.callback_query.answer.assert_called()
+    assert "лише власник" in u.callback_query.answer.call_args[0][0] and not bot.MQTT_CLIENT.publish.called
+    # адмін: екран з перемикачами й лімітом
+    text, kb = bot.control_view("main", 1)
+    assert "Вихід AC" in text and "Максимальний заряд" in text
+    assert "cx:main:dc_switch:ON" in _buttons(kb) and "cx:main:ac_switch:OFF" in _buttons(kb) and "cl:main:80" in _buttons(kb)
+    # команда: публікація в MQTT, екран «виконується» без кнопок керування
+    u = _click(1, "cx:main:dc_switch:ON")
+    bot.MQTT_CLIENT.publish.assert_called_once_with(f"{base}/dc_switch/set", "ON", qos=1, retain=False)
+    assert "Виконується" in edited(u) and not [b for b in _buttons(u.callback_query.edit_message_text.call_args[1]["reply_markup"]) if b.startswith(("cx", "cl"))]
+    # друга команда, поки перша не підтверджена, — відмова
+    u = _click(1, "cx:main:usb_switch:ON")
+    assert bot.MQTT_CLIENT.publish.call_count == 1 and "ще виконується" in u.callback_query.answer.call_args[0][0]
+    # без підтвердження станції команда висить; після підтвердження — знімається
+    cctx = _check_ctx()
+    run(bot.check_pending(cctx))
+    assert "main" in bot.PENDING
+    _feed("main", dc_switch="ON")
+    run(bot.check_pending(cctx))
+    assert "main" not in bot.PENDING and cctx.bot.send_message.called and "Готово" in cctx.bot.send_message.call_args[0][1]
+    # таймаут
+    _click(1, "cl:main:80")
+    assert bot.MQTT_CLIENT.publish.call_args[0][:2] == (f"{base}/ac_charging_limit/set", "80")
+    bot.PENDING["main"]["since"] -= 1000
+    cctx = _check_ctx()
+    run(bot.check_pending(cctx))
+    assert "main" not in bot.PENDING and "не підтвердила" in cctx.bot.send_message.call_args[0][1]
+    # вже так і є
+    n = bot.MQTT_CLIENT.publish.call_count
+    u = _click(1, "cx:main:ac_switch:ON")
+    assert bot.MQTT_CLIENT.publish.call_count == n and "Уже так і є" in u.callback_query.answer.call_args[0][0]
+
+
+def test_control_confirm_text_limit_offline():
+    bot.PENDING.clear()
+    bot.MQTT_CLIENT = MagicMock()
+    bot.MQTT_CLIENT.publish.return_value = SimpleNamespace(rc=0)
+    _feed("main", availability="online", ac_switch="ON", output_watts=120, ac_charging_limit=100)
+    # вимкнення виходу з навантаженням — спочатку підтвердження
+    u = _click(1, "cx:main:ac_switch:OFF")
+    assert "вимкнеться" in edited(u) and not bot.MQTT_CLIENT.publish.called
+    assert set(_buttons(u.callback_query.edit_message_text.call_args[1]["reply_markup"])) == {"cy:main:ac_switch:OFF", "cn:main"}
+    u = _click(1, "cn:main")
+    assert "Керування" in edited(u) and not bot.MQTT_CLIENT.publish.called
+    _click(1, "cy:main:ac_switch:OFF")
+    assert bot.MQTT_CLIENT.publish.call_args[0][1] == "OFF"
+    bot.PENDING.clear()
+    # свій ліміт заряду текстом
+    upd, ctx = make_update(1, data="cli:main")
+    run(bot.on_button(upd, ctx))
+    assert ctx.user_data["limit_for"] == "main"
+    bad, _ = make_update(1, "abc")
+    run(bot.on_text(bad, ctx))
+    assert "від 3 до 100" in said(bad) and ctx.user_data.get("limit_for") == "main"
+    good, _ = make_update(1, "70%")
+    run(bot.on_text(good, ctx))
+    assert bot.MQTT_CLIENT.publish.call_args[0][:2] == (f"{S.devices()['main']['topic_base']}/ac_charging_limit/set", "70")
+    assert "limit_for" not in ctx.user_data and "Виконується" in said(good)
+    bot.PENDING.clear()
+    # станція не на зв'язку — команди не йдуть
+    _feed("main", availability="offline")
+    n = bot.MQTT_CLIENT.publish.call_count
+    ok, msg = bot.start_action(1, "main", "usb_switch", "ON")
+    assert not ok and "не на зв'язку" in msg and bot.MQTT_CLIENT.publish.call_count == n
+    _feed("main", availability="online")
+    # відсутній зв'язок із брокером
+    bot.MQTT_CLIENT.publish.return_value = SimpleNamespace(rc=4)
+    ok, msg = bot.start_action(1, "main", "usb_switch", "ON")
+    assert not ok and "Не вдалося" in msg and "main" not in bot.PENDING
+
+
+def test_stats_and_summary():
+    from history import History
+    bot.HISTORY = History(TMP / "hist.db")
+    now = time.time()
+    for i in range(120):                               # година даних: вхід 600 Вт, вихід 200 Вт
+        bot.HISTORY.add_sample("main", now - i * 30, 80, 600, 200, 1)
+    text = bot.stats_body("main", "w")
+    assert "Отримано" in text and "595 Вт·год" in text and "Відключень світла: <b>немає" in text and "Піковий вихід" in text
+    bot.HISTORY.add_event("main", now - 1800, "light_off", now - 3600)
+    bot.HISTORY.add_event("main", now - 600, "light_on", now - 1800)
+    assert "Відключень світла: <b>1</b>" in bot.stats_body("main", "w") and "30 хв" in bot.stats_body("main", "w")
+    assert {"sx:main:d", "sx:main:w", "sx:main:m"} <= set(_buttons(bot.stats_view("main", 1)[1]))
+    u = _click(1, "sx:main:w")
+    assert "7 днів" in edited(u)
+    upd, ctx = make_update(1, "📈 Статистика")
+    run(bot.on_menu_text(upd, ctx))
+    assert "Статистика" in said(upd)
+    # підсумок дня: налаштування
+    t, kb = bot.notify_view("main", 1)
+    assert "Підсумок дня о 21:00" in [b.text.lstrip("✅⬜ ") for r in kb.inline_keyboard for b in r] and "nm:main:2000" in _buttons(kb) and "nt:main:summary" in _buttons(kb)
+    _click(1, "nm:main:2000")
+    assert S.notify(1, "main")["summary_time"] == "20:00"
+    # відправка: у вказаний час, один раз на добу
+    S.set_notify(1, "main", "summary", True)
+    S.set_notify(1, "main", "summary_time", (datetime.now(bot.TZ) - timedelta(minutes=1)).strftime("%H:%M"))
+    cctx = _check_ctx()
+    run(bot.send_summaries(cctx))
+    sent = [c for c in cctx.bot.send_message.call_args_list if c[0][0] == 1]
+    assert len(sent) == 1 and "Підсумок дня" in sent[0][0][1]
+    cctx2 = _check_ctx()
+    run(bot.send_summaries(cctx2))
+    assert not cctx2.bot.send_message.called
+    # ще не настав час — мовчить
+    S.set_summary_last(1, "main", "2000-01-01")
+    S.set_notify(1, "main", "summary_time", (datetime.now(bot.TZ) + timedelta(hours=2)).strftime("%H:%M"))
+    cctx3 = _check_ctx()
+    run(bot.send_summaries(cctx3))
+    assert not cctx3.bot.send_message.called
+    S.set_notify(1, "main", "summary", False)
+    bot.HISTORY = None
+
+
+def test_sampler_and_events_to_history():
+    from history import History
+    bot.HISTORY = History(TMP / "hist2.db")
+    _feed("main", availability="online", battery=77, input_watts=300, output_watts=100, ac_input_watts=300)
+    run(bot.sample_history(None))
+    rows = bot.HISTORY.samples("main", 0, time.time() + 5)
+    assert len(rows) == 1 and rows[0][1:4] == (77.0, 300.0, 100.0) and rows[0][4] == 1
+    bot.HISTORY = None
+    run(bot.sample_history(None))                     # без історії — тихо нічого не робить
 
 
 def STORE_DATA():

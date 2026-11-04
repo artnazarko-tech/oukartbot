@@ -26,9 +26,21 @@ ROLE_TITLES = {ROLE_ADMIN: "Адмін", ROLE_OWNER: "Власник", ROLE_GUES
 INVITE_TTL_S = 48 * 3600
 
 # Сповіщення, які людина може вмикати окремо для кожної станції (за замовчуванням ВСІ вимкнені)
-NOTIFY_KEYS = ("light_on", "light_off", "full", "low", "error", "stale")
+NOTIFY_KEYS = ("light_on", "light_off", "full", "low", "error", "stale", "summary")
 DEFAULT_LOW_LEVEL = 20
 LOW_LEVELS = (10, 15, 20, 30, 40, 50)
+DEFAULT_SUMMARY_TIME = "21:00"
+SUMMARY_TIMES = ("18:00", "20:00", "21:00", "22:00", "23:00")
+
+
+def _valid_time(value) -> str | None:
+    """'21:00' / '9:5' -> '21:00' / '09:05'; не час -> None."""
+    try:
+        hh, mm = str(value).split(":")
+        hh, mm = int(hh), int(mm)
+    except (ValueError, AttributeError):
+        return None
+    return f"{hh:02d}:{mm:02d}" if 0 <= hh < 24 and 0 <= mm < 60 else None
 
 
 def _empty() -> dict:
@@ -230,17 +242,34 @@ class Store:
         saved = ((self.get_user(chat_id) or {}).get("notify") or {}).get(dev_id, {})
         prefs = {k: bool(saved.get(k, False)) for k in NOTIFY_KEYS}
         prefs["low_level"] = int(saved.get("low_level", DEFAULT_LOW_LEVEL))
+        prefs["summary_time"] = _valid_time(saved.get("summary_time")) or DEFAULT_SUMMARY_TIME
         return prefs
 
     def set_notify(self, chat_id: int, dev_id: str, key: str, value) -> None:
-        if key not in NOTIFY_KEYS and key != "low_level":
+        if key not in NOTIFY_KEYS and key not in ("low_level", "summary_time"):
             raise ValueError(f"Невідоме сповіщення: {key}")
+        if key == "summary_time":
+            value = _valid_time(value)
+            if value is None:
+                raise ValueError("Час має бути у форматі ГГ:ХХ")
         with self._lock:
             user = self.get_user(chat_id)
             if user is None:
                 return
-            user.setdefault("notify", {}).setdefault(dev_id, {})[key] = int(value) if key == "low_level" else bool(value)
+            prefs = user.setdefault("notify", {}).setdefault(dev_id, {})
+            prefs[key] = value if key == "summary_time" else (int(value) if key == "low_level" else bool(value))
             self.save()
+
+    def summary_last(self, chat_id: int, dev_id: str) -> str | None:
+        """Дата (ГГГГ-ММ-ДД), за яку підсумок дня вже надіслано."""
+        return (((self.get_user(chat_id) or {}).get("notify") or {}).get(dev_id) or {}).get("summary_last")
+
+    def set_summary_last(self, chat_id: int, dev_id: str, day: str) -> None:
+        with self._lock:
+            user = self.get_user(chat_id)
+            if user is not None:
+                user.setdefault("notify", {}).setdefault(dev_id, {})["summary_last"] = day
+                self.save()
 
     # ------------------------------------------------------------ запрошення
     def create_invite(self, role: str, devices: list[str], created_by: int, ttl: int = INVITE_TTL_S) -> str:

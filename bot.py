@@ -36,7 +36,8 @@ from telegram.error import BadRequest
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
                           ContextTypes, MessageHandler, filters)
 
-from store import (LOW_LEVELS, NOTIFY_KEYS, ROLE_ADMIN, ROLE_GUEST, ROLE_OWNER, ROLE_TITLES, Store,
+from history import History, compute_stats
+from store import (LOW_LEVELS, NOTIFY_KEYS, SUMMARY_TIMES, ROLE_ADMIN, ROLE_GUEST, ROLE_OWNER, ROLE_TITLES, Store,
                    import_legacy_schedules)
 
 load_dotenv()
@@ -67,7 +68,9 @@ DEFAULT_DEVICE_ID = "main"
 DEFAULT_DEVICE_NAME = os.getenv("DEVICE_NAME", "Станція")   # тимчасова назва, поки справжню не знайдено
 # Журнал(и) моста: звідти береться справжня назва станції (міст пише її лише в лог, не в MQTT)
 BRIDGE_LOG_FILES = [p.strip() for p in os.getenv("BRIDGE_LOG_FILES", "/bridge/oukitel_bridge.log").split(",") if p.strip()]
-UI_VERSION = 3   # при зміні меню/важливих правил бот один раз повідомляє про це всіх
+HISTORY_FILE = Path(os.getenv("HISTORY_FILE", "data/history.db"))
+CONTROL_TIMEOUT_S = int(os.getenv("CONTROL_TIMEOUT_S", "90"))   # скільки чекати підтвердження станції після команди
+UI_VERSION = 4   # при зміні меню/важливих правил бот один раз повідомляє про це всіх
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
 log = logging.getLogger("oukitel-bot")
@@ -192,6 +195,9 @@ def serial_key(serial: str) -> str:
 STATES: dict[str, StationState] = {}
 ADMIN_NOTICES: list[str] = []       # повідомлення для адмінів від MQTT-потоку; розсилає check_alerts
 STORE: Store = None  # type: ignore[assignment]  # створюється в main()
+HISTORY: History | None = None      # історія для статистики; створюється в main()
+MQTT_CLIENT = None                  # клієнт MQTT для надсилання команд станції; створюється в main()
+PENDING: dict[str, dict] = {}       # команда, яку станція ще не підтвердила: не більше однієї на станцію
 
 
 def state_of(dev_id: str) -> StationState:
@@ -595,7 +601,11 @@ NOTIFY_TITLES = {
 
 
 def notify_title(key: str, prefs: dict) -> str:
-    return f"Заряд станції {prefs['low_level']}%" if key == "low" else NOTIFY_TITLES[key]
+    if key == "low":
+        return f"Заряд станції {prefs['low_level']}%"
+    if key == "summary":
+        return f"Підсумок дня о {prefs['summary_time']}"
+    return NOTIFY_TITLES[key]
 
 
 def alerts_view(chat_id: int) -> View:
@@ -619,7 +629,7 @@ def notify_view(dev_id: str, chat_id: int) -> View:
         f"🔔 <b>Сповіщення — {esc(STORE.label(chat_id, dev_id))}</b>\n\n"
         f"<b>Зараз увімкнено:</b>\n{current}\n\n"
         "Натисни на сповіщення, щоб увімкнути чи вимкнути його. "
-        "Для заряду нижче обери поріг — коли попереджати."
+        "Для заряду нижче обери поріг — коли попереджати, для підсумку дня — час."
     )
     rows = []
     for key in NOTIFY_KEYS:
@@ -627,14 +637,294 @@ def notify_view(dev_id: str, chat_id: int) -> View:
         if key == "low":
             rows.append([B(("● " if prefs["low_level"] == lvl else "") + f"{lvl}%", callback_data=f"nl:{dev_id}:{lvl}")
                          for lvl in LOW_LEVELS])
+        if key == "summary":
+            rows.append([B(("● " if prefs["summary_time"] == t else "") + t, callback_data=f"nm:{dev_id}:{t.replace(':', '')}")
+                         for t in SUMMARY_TIMES])
     rows.append([B("⏰ Розклад звітів", callback_data="sch:open")])
     back = "m:alerts" if len(STORE.devices_for(chat_id)) > 1 else "m:main"
     rows.append([B("⬅️ Назад", callback_data=back), HOME])
     return text, InlineKeyboardMarkup(rows)
 
 
-def soon_view(title: str) -> View:
-    return f"{title}\n\n🚧 Цей розділ ще в розробці. Скоро буде!", InlineKeyboardMarkup([[HOME]])
+# ---------------------------------------------------------------- керування
+SWITCHES = (("ac_switch", "Вихід AC (розетки)"), ("dc_switch", "Вихід DC 12 В"), ("usb_switch", "USB"))
+LIMIT_PRESETS = (50, 60, 70, 80, 90, 100)
+LIMIT_KEY = "ac_charging_limit"
+OFF_CONFIRM_W = 10.0       # вимикаючи вихід із таким навантаженням, просимо підтвердження
+
+
+def switch_on(values: dict, key: str) -> bool | None:
+    v = values.get(key)
+    if v is None:
+        return None
+    return str(v).strip().upper() in ("ON", "1", "TRUE")
+
+
+def control_keys(values: dict) -> list[tuple[str, str]]:
+    """Які перемикачі взагалі є в цієї станції (USB — не в усіх моделей)."""
+    return [(k, t) for k, t in SWITCHES if switch_on(values, k) is not None]
+
+
+def action_title(key: str, target) -> str:
+    if key == LIMIT_KEY:
+        return f"Максимальний заряд {target}%"
+    name = dict(SWITCHES).get(key, key)
+    return f"{name}: {'увімкнути' if target == 'ON' else 'вимкнути'}"
+
+
+def output_load_w(values: dict, key: str) -> float:
+    """Яке навантаження вимкнеться разом із цим виходом."""
+    if key == "dc_switch":
+        return num(values, "dc_output_power") or 0.0
+    if key == "ac_switch":
+        return num(values, "ac_output_power", "output_watts", "total_output_power", "output_power") or 0.0
+    return 0.0
+
+
+def pending_for(dev_id: str) -> dict | None:
+    p = PENDING.get(dev_id)
+    if p and time.time() - p["since"] > CONTROL_TIMEOUT_S + 30:    # страховка: job мав би її прибрати раніше
+        PENDING.pop(dev_id, None)
+        return None
+    return p
+
+
+def action_done(values: dict, key: str, target) -> bool:
+    if key == LIMIT_KEY:
+        cur = num(values, LIMIT_KEY)
+        return cur is not None and int(round(cur)) == int(target)
+    return switch_on(values, key) == (target == "ON")
+
+
+def send_command(dev_id: str, key: str, payload: str) -> bool:
+    """Публікує команду в MQTT: <base>/<ключ>/set."""
+    base = STORE.devices().get(dev_id, {}).get("topic_base")
+    if not base or MQTT_CLIENT is None:
+        return False
+    try:
+        info = MQTT_CLIENT.publish(f"{base}/{key}/set", payload, qos=1, retain=False)
+        return info.rc == 0
+    except Exception as e:  # noqa: BLE001
+        log.warning("Не вдалося надіслати команду: %s", e)
+        return False
+
+
+def start_action(chat_id: int, dev_id: str, key: str, target) -> tuple[bool, str]:
+    """Перевіряє, чи можна виконати команду зараз, і надсилає її. Повертає (успіх, текст для людини)."""
+    if not STORE.can_control(chat_id, dev_id):
+        return False, "⛔ Керувати цією станцією може лише власник"
+    if pending_for(dev_id):
+        return False, "⏳ Попередня команда ще виконується — дочекайся відповіді станції"
+    values, updated = state_of(dev_id).snapshot()
+    if not updated or time.time() - updated > 120 or str(values.get("availability", "online")).lower() == "offline":
+        return False, "📴 Станція зараз не на зв'язку — командувати не можна"
+    if key == LIMIT_KEY:
+        if not isinstance(target, int) or not 3 <= target <= 100:
+            return False, "Ліміт має бути від 3 до 100%"
+        payload = str(target)
+    else:
+        if key not in dict(control_keys(values)) or target not in ("ON", "OFF"):
+            return False, "Станція не підтримує цю дію"
+        payload = target
+    if action_done(values, key, target):
+        return False, "Уже так і є"
+    if not send_command(dev_id, key, payload):
+        return False, "⚠️ Не вдалося надіслати команду (нема зв'язку з брокером). Спробуй ще раз"
+    PENDING[dev_id] = {"key": key, "target": target, "chat": chat_id, "since": time.time(), "msg": None}
+    log.info("Команда %s=%s для %s від %s", key, payload, dev_id, chat_id)
+    return True, f"Команду надіслано: {action_title(key, target)}"
+
+
+def control_entry_view(chat_id: int) -> View:
+    devs = STORE.devices_for(chat_id)
+    if not devs:
+        return "У тебе поки немає доступу до жодної станції. Попроси адміна.", InlineKeyboardMarkup([[HOME]])
+    mine = [d for d in devs if STORE.can_control(chat_id, d)]
+    if not mine:
+        return ("🎛 <b>Керування</b>\n\nУ тебе роль «Гість» — можна лише дивитися. Щоб керувати, попроси адміна "
+                "зробити тебе власником станції."), InlineKeyboardMarkup([[HOME]])
+    if len(mine) == 1:
+        return control_view(mine[0], chat_id)
+    rows = [[B(STORE.label(chat_id, d), callback_data=f"cu:{d}")] for d in mine] + [[HOME]]
+    return "🎛 <b>Керування</b>\n\nЯкою станцією керувати?", InlineKeyboardMarkup(rows)
+
+
+def control_view(dev_id: str, chat_id: int, note: str = "") -> View:
+    values, updated = state_of(dev_id).snapshot()
+    many = len([d for d in STORE.devices_for(chat_id) if STORE.can_control(chat_id, d)]) > 1
+    back = "m:control" if many else "m:main"
+    lines = [f"🎛 <b>Керування — {esc(STORE.label(chat_id, dev_id))}</b>", ""]
+    if note:
+        lines += [note, ""]
+    if not updated:
+        lines.append("Даних від станції ще немає.")
+        return "\n".join(lines), InlineKeyboardMarkup([[B("🔄 Оновити", callback_data=f"cu:{dev_id}")], [B("⬅️ Назад", callback_data=back), HOME]])
+    keys = control_keys(values)
+    for key, title in keys:
+        lines.append(f"{'✅' if switch_on(values, key) else '⬜'} {title}: {'увімкнено' if switch_on(values, key) else 'вимкнено'}")
+    limit = num(values, LIMIT_KEY)
+    if limit is not None:
+        lines.append(f"🔋 Максимальний заряд: <b>{limit:.0f}%</b>")
+    ts, stale = updated_line(updated)
+    p = pending_for(dev_id)
+    rows = []
+    if p:
+        wait = int(max(0, CONTROL_TIMEOUT_S - (time.time() - p["since"])))
+        lines += ["", f"⏳ <b>Виконується:</b> {action_title(p['key'], p['target'])}",
+                  f"Чекаю підтвердження станції (до {wait} с). Нові команди поки недоступні."]
+    else:
+        for key, title in keys:
+            on = switch_on(values, key)
+            short = title.split(" (")[0]
+            rows.append([B(f"{'⏹ Вимкнути' if on else '▶️ Увімкнути'}: {short}",
+                           callback_data=f"cx:{dev_id}:{key}:{'OFF' if on else 'ON'}")])
+        if limit is not None:
+            rows.append([B(("● " if round(limit) == v else "") + f"{v}%", callback_data=f"cl:{dev_id}:{v}") for v in LIMIT_PRESETS[:3]])
+            rows.append([B(("● " if round(limit) == v else "") + f"{v}%", callback_data=f"cl:{dev_id}:{v}") for v in LIMIT_PRESETS[3:]])
+            rows.append([B("✍️ Свій ліміт заряду", callback_data=f"cli:{dev_id}")])
+    lines.append(f"\n🕐 Оновлено: {ts}{stale}")
+    rows.append([B("🔄 Оновити", callback_data=f"cu:{dev_id}")])
+    rows.append([B("⬅️ Назад", callback_data=back), HOME])
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+
+def confirm_view(dev_id: str, chat_id: int, key: str, load: float) -> View:
+    title = dict(SWITCHES).get(key, key)
+    text = (f"⚠️ <b>{esc(title)}</b>: зараз до цього виходу підключено навантаження ≈ {load:.0f} Вт — "
+            "воно вимкнеться. Вимкнути?")
+    kb = InlineKeyboardMarkup([[B("⏹ Так, вимкнути", callback_data=f"cy:{dev_id}:{key}:OFF"),
+                                B("↩️ Скасувати", callback_data=f"cn:{dev_id}")]])
+    return text, kb
+
+
+async def check_pending(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Раз на 2 с дивиться, чи станція підтвердила команду (її стан у MQTT став таким, як просили)."""
+    for dev_id, p in list(PENDING.items()):
+        values, _ = state_of(dev_id).snapshot()
+        done = action_done(values, p["key"], p["target"])
+        timeout = time.time() - p["since"] > CONTROL_TIMEOUT_S
+        if not (done or timeout):
+            continue
+        PENDING.pop(dev_id, None)
+        chat_id = p["chat"]
+        if done:
+            note = f"✅ Готово: {action_title(p['key'], p['target'])}"
+        else:
+            note = (f"⚠️ Станція не підтвердила команду за {CONTROL_TIMEOUT_S} с: {action_title(p['key'], p['target'])}. "
+                    "Перевір її стан і спробуй ще раз.")
+        text, kb = control_view(dev_id, chat_id, note)
+        try:
+            if p.get("msg"):
+                await context.bot.edit_message_text(text, chat_id=chat_id, message_id=p["msg"], parse_mode="HTML", reply_markup=kb)
+            if not done or not p.get("msg"):          # невдачу (або «загублене» вікно) надсилаємо окремим повідомленням
+                await context.bot.send_message(chat_id, note, parse_mode="HTML")
+        except Exception as e:  # noqa: BLE001
+            log.warning("Не вдалося повідомити %s про результат команди: %s", chat_id, e)
+
+
+# ---------------------------------------------------------------- статистика
+PERIODS = {"d": "Сьогодні", "w": "7 днів", "m": "30 днів"}
+
+
+def period_range(period: str, now: float | None = None) -> tuple[float, float]:
+    now = now or time.time()
+    if period == "d":
+        return datetime.fromtimestamp(now, TZ).replace(hour=0, minute=0, second=0, microsecond=0).timestamp(), now
+    return now - (7 if period == "w" else 30) * 86400, now
+
+
+def fmt_energy(wh: float) -> str:
+    return f"{wh / 1000:.2f} кВт·год" if wh >= 1000 else f"{wh:.0f} Вт·год"
+
+
+def stats_body(dev_id: str, period: str, now: float | None = None) -> str:
+    now = now or time.time()
+    t0, t1 = period_range(period, now)
+    if HISTORY is None:
+        return "Історія недоступна."
+    r = compute_stats(HISTORY.samples(dev_id, t0, t1), HISTORY.events(dev_id, t0 - 86400, t1), t0, t1, now)
+    first = HISTORY.first_ts(dev_id)
+    if not r["samples"]:
+        return "Даних за цей період поки немає — бот збирає їх щоразу, коли станція на зв'язку."
+    L = [f"⬇️ Отримано (вхід): <b>{fmt_energy(r['in_wh'])}</b>",
+         f"⬆️ Віддано (вихід): <b>{fmt_energy(r['out_wh'])}</b>"]
+    if r["outage_count"]:
+        L.append(f"🔌 Відключень світла: <b>{r['outage_count']}</b>, разом {fmt_duration(r['outage_total_s'])}")
+    else:
+        L.append("🔌 Відключень світла: <b>немає</b>" if not r["outage_total_s"] else
+                 f"🔌 Відключення тривало {fmt_duration(r['outage_total_s'])} (почалось раніше)")
+    L.append(f"⚡ Піковий вихід: <b>{fmt_w(r['max_out_w'])}</b>")
+    if r["charge_count"]:
+        L.append(f"🔋 Середня тривалість зарядки: <b>{fmt_duration(r['charge_avg_s'])}</b> (зарядок: {r['charge_count']})")
+    else:
+        L.append("🔋 Середня тривалість зарядки: —  (повних сесій не було)")
+    if first and first > t0 + 3600:
+        L.append(f"\nℹ️ Дані збираються лише з {datetime.fromtimestamp(first, TZ).strftime('%d.%m.%Y %H:%M')}")
+    return "\n".join(L)
+
+
+def stats_entry_view(chat_id: int) -> View:
+    devs = STORE.devices_for(chat_id)
+    if not devs:
+        return "У тебе поки немає доступу до жодної станції. Попроси адміна.", InlineKeyboardMarkup([[HOME]])
+    if len(devs) == 1:
+        return stats_view(devs[0], chat_id, "d")
+    rows = [[B(STORE.label(chat_id, d), callback_data=f"sp:{d}")] for d in devs] + [[HOME]]
+    return "📈 <b>Статистика</b>\n\nДля якої станції?", InlineKeyboardMarkup(rows)
+
+
+def stats_view(dev_id: str, chat_id: int, period: str = "d") -> View:
+    period = period if period in PERIODS else "d"
+    text = f"📈 <b>Статистика — {esc(STORE.label(chat_id, dev_id))}</b>\nПеріод: <b>{PERIODS[period]}</b>\n\n{stats_body(dev_id, period)}"
+    back = "m:stats" if len(STORE.devices_for(chat_id)) > 1 else "m:main"
+    rows = [[B(("● " if k == period else "") + t, callback_data=f"sx:{dev_id}:{k}") for k, t in PERIODS.items()],
+            [B("⬅️ Назад", callback_data=back), HOME]]
+    return text, InlineKeyboardMarkup(rows)
+
+
+async def sample_history(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Раз на 30 с записує показання кожної станції (лише свіжі) для статистики."""
+    if HISTORY is None:
+        return
+    now = time.time()
+    for dev_id in STORE.devices():
+        st = state_of(dev_id)
+        values, updated = st.snapshot()
+        if not updated or now - updated > 90:
+            continue
+        on, certain = st.grid_status()
+        HISTORY.add_sample(dev_id, now, num(values, "battery", "battery_level", "soc"),
+                           num(values, "input_watts", "total_input_power", "input_power"),
+                           num(values, "output_watts", "total_output_power", "output_power"),
+                           (1 if on else 0) if certain and on is not None else None)
+
+
+async def purge_history(context: ContextTypes.DEFAULT_TYPE) -> None:
+    if HISTORY is not None:
+        HISTORY.purge(time.time() - 400 * 86400)
+
+
+async def send_summaries(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Підсумок дня: у вказаний людиною час (протягом 15 хв після нього), раз на добу."""
+    now = datetime.now(TZ)
+    today = now.strftime("%Y-%m-%d")
+    for dev_id in STORE.devices():
+        for chat_id in STORE.users_for_device(dev_id):
+            prefs = STORE.notify(chat_id, dev_id)
+            if not prefs["summary"] or STORE.summary_last(chat_id, dev_id) == today:
+                continue
+            hh, mm = map(int, prefs["summary_time"].split(":"))
+            due = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+            if not 0 <= (now - due).total_seconds() < 900:
+                continue
+            STORE.set_summary_last(chat_id, dev_id, today)     # відмічаємо до відправки: краще пропустити, ніж надіслати двічі
+            body = await asyncio.to_thread(stats_body, dev_id, "d")
+            text = f"🌙 <b>Підсумок дня — {esc(STORE.label(chat_id, dev_id))}</b>\n\n{body}"
+            try:
+                await context.bot.send_message(chat_id, text, parse_mode="HTML")
+            except Exception as e:  # noqa: BLE001
+                log.warning("Не вдалося надіслати підсумок в %s: %s", chat_id, e)
+
 
 
 def schedule_view(chat_id: int) -> View:
@@ -697,7 +987,12 @@ HELP_COMMON = (
     "(поріг обираєш сам), помилка станції, немає даних. Налаштування окремі для кожної людини й станції. "
     "Там же «⏰ Розклад звітів»: бот сам надсилатиме стан у потрібний час або кожні кілька хвилин "
     "(свій час: /schedule 08:30).\n\n"
-    "🎛 <b>Керування</b> і 📈 <b>Статистика</b> — скоро."
+    "🎛 <b>Керування</b> (власник і адмін) — вмикай і вимикай виходи AC, DC і USB та обирай максимальний заряд. "
+    "За раз виконується одна команда: наступну можна дати, коли станція підтвердить попередню. "
+    "Якщо вимикаєш вихід із увімкненим навантаженням, бот перепитає.\n\n"
+    "📈 <b>Статистика</b> — за сьогодні, 7 чи 30 днів: скільки енергії отримано й віддано, скільки було відключень світла "
+    "і як довго, піковий вихід, середня тривалість зарядки. Дані бот збирає сам, тож історія з'являється поступово.\n"
+    "🌙 «Підсумок дня» — у «Сповіщення» можна увімкнути щоденне повідомлення з підсумком у зручний час."
 )
 HELP_ADMIN = (
     "\n\n👥 <b>Користувачі</b> — хто має доступ і до яких станцій; тут можна змінити роль чи видалити людину.\n\n"
@@ -722,6 +1017,18 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not allowed(update):
         return
     await reply_view(update, status_entry_view(update.effective_chat.id))
+
+
+async def cmd_control(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not allowed(update):
+        return
+    await reply_view(update, control_entry_view(update.effective_chat.id))
+
+
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not allowed(update):
+        return
+    await reply_view(update, stats_entry_view(update.effective_chat.id))
 
 
 async def cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -834,6 +1141,7 @@ def rename_prompt(chat_id: int, dev_id: str, official: bool = False) -> str:
 
 
 def start_rename(context: ContextTypes.DEFAULT_TYPE, dev_id: str, official: bool) -> None:
+    context.user_data.pop("limit_for", None)
     context.user_data["rename"] = dev_id
     context.user_data["rename_scope"] = "official" if official else "personal"
 
@@ -872,6 +1180,10 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Звичайний текст: приймаємо лише якщо чекаємо нову назву станції."""
     if not allowed(update):
         return
+    lim_dev = context.user_data.get("limit_for")
+    if lim_dev:
+        await limit_from_text(update, context, lim_dev)
+        return
     dev_id = context.user_data.get("rename")
     if not dev_id:
         return
@@ -900,6 +1212,23 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     stop_rename(context)
     await update.message.reply_text(reply, parse_mode="HTML")
+
+
+async def limit_from_text(update: Update, context: ContextTypes.DEFAULT_TYPE, dev_id: str) -> None:
+    chat_id = update.effective_chat.id
+    raw = (update.message.text or "").strip().rstrip("%").strip()
+    if not STORE.can_control(chat_id, dev_id):
+        context.user_data.pop("limit_for", None)
+        return
+    if not raw.isdigit() or not 3 <= int(raw) <= 100:
+        await update.message.reply_text("Напиши число від 3 до 100 або скасуй, натиснувши будь-яку кнопку меню.")
+        return
+    context.user_data.pop("limit_for", None)
+    ok, note = start_action(chat_id, dev_id, LIMIT_KEY, int(raw))
+    text, kb = control_view(dev_id, chat_id, note if ok else f"⚠️ {note}")
+    sent = await update.message.reply_text(text, parse_mode="HTML", reply_markup=kb)
+    if ok and PENDING.get(dev_id):
+        PENDING[dev_id]["msg"] = getattr(sent, "message_id", None)
 
 
 async def sync_bridge_names(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1022,16 +1351,17 @@ async def on_menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not allowed(update):
         return
     chat_id = update.effective_chat.id
-    stop_rename(context)      # натиснув кнопку меню — вводити назву вже не чекаємо
+    stop_rename(context)      # натиснув кнопку меню — вводити назву чи ліміт вже не чекаємо
+    context.user_data.pop("limit_for", None)
     text = update.message.text
     if text == BTN_STATUS:
         view = status_entry_view(chat_id)
     elif text == BTN_CONTROL:
-        view = soon_view("🎛 <b>Керування</b>")
+        view = control_entry_view(chat_id)
     elif text == BTN_ALERTS:
         view = alerts_view(chat_id)
     elif text == BTN_STATS:
-        view = soon_view("📈 <b>Статистика</b>")
+        view = stats_entry_view(chat_id)
     elif text == BTN_HELP:
         view = help_view(chat_id)
     elif text == BTN_SCHEDULE:
@@ -1063,9 +1393,9 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             views = {
                 "main": lambda: main_menu_view(chat_id),
                 "status": lambda: status_entry_view(chat_id),
-                "control": lambda: soon_view("🎛 <b>Керування</b>"),
+                "control": lambda: control_entry_view(chat_id),
                 "alerts": lambda: alerts_view(chat_id),
-                "stats": lambda: soon_view("📈 <b>Статистика</b>"),
+                "stats": lambda: stats_entry_view(chat_id),
                 "help": lambda: help_view(chat_id),
                 "users": users_view,
             }
@@ -1104,6 +1434,71 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             else:
                 await query.answer()
             text, kb = notify_view(dev_id, chat_id)
+            await query.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
+            return
+
+        # --- підсумок дня: час (nm:<станція>:<ГГХХ>)
+        if data.startswith("nm:"):
+            _, dev_id, hhmm = data.split(":")
+            if not STORE.role(chat_id, dev_id) or hhmm not in [t.replace(":", "") for t in SUMMARY_TIMES]:
+                await query.answer("⛔ Недоступно")
+                return
+            STORE.set_notify(chat_id, dev_id, "summary_time", f"{hhmm[:2]}:{hhmm[2:]}")
+            await query.answer(f"Підсумок о {hhmm[:2]}:{hhmm[2:]}")
+            text, kb = notify_view(dev_id, chat_id)
+            await query.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
+            return
+
+        # --- керування: cu — відкрити, cx — команда (з підтвердженням), cy — підтверджено, cn — скасовано, cl/cli — ліміт заряду
+        if data.startswith(("cu:", "cx:", "cy:", "cn:", "cl:", "cli:")):
+            parts = data.split(":")
+            dev_id = parts[1]
+            if not STORE.role(chat_id, dev_id):
+                await query.answer("⛔ Немає доступу до цієї станції")
+                return
+            kind = parts[0]
+            if kind != "cu" and not STORE.can_control(chat_id, dev_id):
+                await query.answer("⛔ Керувати може лише власник", show_alert=True)
+                return
+            note = ""
+            if kind == "cli":
+                stop_rename(context)
+                context.user_data["limit_for"] = dev_id
+                await query.answer()
+                await query.message.reply_text("✍️ Напиши, до скількох відсотків заряджати станцію (від 3 до 100).")
+                return
+            if kind in ("cx", "cy") and len(parts) == 4:
+                key, target = parts[2], parts[3]
+                values, _ = state_of(dev_id).snapshot()
+                load = output_load_w(values, key)
+                if kind == "cx" and target == "OFF" and load >= OFF_CONFIRM_W and key in dict(SWITCHES) and not pending_for(dev_id):
+                    text, kb = confirm_view(dev_id, chat_id, key, load)
+                    await query.answer()
+                    await query.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
+                    return
+                ok, msg = start_action(chat_id, dev_id, key, target)
+                note = f"✅ {msg}" if ok else f"⚠️ {msg}"
+            elif kind == "cl" and len(parts) == 3 and parts[2].isdigit():
+                ok, msg = start_action(chat_id, dev_id, LIMIT_KEY, int(parts[2]))
+                note = f"✅ {msg}" if ok else f"⚠️ {msg}"
+            if note:
+                await query.answer(note[:180], show_alert=note.startswith("⚠️"))
+            else:
+                await query.answer("Оновлено" if kind == "cu" else None)
+            if note.startswith("✅") and PENDING.get(dev_id):
+                PENDING[dev_id]["msg"] = getattr(query.message, "message_id", None)
+            text, kb = control_view(dev_id, chat_id, "" if note.startswith("✅") else note)
+            await query.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
+            return
+
+        # --- статистика: sp — вибір станції, sx — період
+        if data.startswith(("sp:", "sx:")):
+            _, dev_id, *rest = data.split(":")
+            if not STORE.role(chat_id, dev_id):
+                await query.answer("⛔ Немає доступу до цієї станції")
+                return
+            await query.answer()
+            text, kb = await asyncio.to_thread(stats_view, dev_id, chat_id, rest[0] if rest else "d")
             await query.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
             return
 
@@ -1276,12 +1671,12 @@ def device_events(app: Application, dev_id: str) -> list[tuple[str, dict]]:
                          num(values, "ac_charging_limit"))
                 if on:
                     began = st.pop("off_since", None)
-                    events.append(("light_on", {"bat": bat, "outage_s": now - began if began else None}))
+                    events.append(("light_on", {"bat": bat, "outage_s": now - began if began else None, "began": since}))
                 else:
                     st["off_since"] = since
                     st["outage_since_full"] = True     # було відключення: «заряджена» знову спрацює вже після спаду до 97%
                     left = fmt_minutes(remain) if tout and tout > 0 and remain else None
-                    events.append(("light_off", {"bat": bat, "left": left if left != "—" else None}))
+                    events.append(("light_off", {"bat": bat, "left": left if left != "—" else None, "began": since}))
         else:
             st.pop("grid_change_since", None)
     elif sig == "idle":
@@ -1364,6 +1759,10 @@ async def check_alerts(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     for dev_id in STORE.devices():
         events = device_events(app, dev_id)
+        if HISTORY is not None:
+            for kind, data in events:
+                if kind in ("light_on", "light_off"):
+                    HISTORY.add_event(dev_id, time.time(), kind, data.get("began"))
         st = app.bot_data["alert_state"].setdefault(dev_id, {})
         values, _ = state_of(dev_id).snapshot()
         bat = num(values, "battery", "battery_level", "soc")
@@ -1465,6 +1864,8 @@ def start_mqtt() -> mqtt.Client:
     client.reconnect_delay_set(min_delay=2, max_delay=60)
     client.connect_async(MQTT_HOST, MQTT_PORT, keepalive=60)
     client.loop_start()
+    global MQTT_CLIENT
+    MQTT_CLIENT = client
     return client
 
 
@@ -1496,6 +1897,8 @@ async def post_init(app: Application) -> None:
         BotCommand("schedules", "Мій розклад"),
         BotCommand("clear", "Очистити розклад"),
         BotCommand("alerts", "Автоматичні сповіщення"),
+        BotCommand("control", "Керування станцією"),
+        BotCommand("stats", "Статистика"),
         BotCommand("invite", "Запросити людину (адмін)"),
         BotCommand("users", "Користувачі (адмін)"),
         BotCommand("debug", "Сирі дані MQTT (адмін)"),
@@ -1506,11 +1909,15 @@ async def post_init(app: Application) -> None:
     app.bot_data["_alert_dump"] = json.dumps(app.bot_data["alert_state"], sort_keys=True, ensure_ascii=False)
     app.job_queue.run_repeating(check_alerts, interval=15, first=30, name="alerts")
     app.job_queue.run_repeating(sync_bridge_names, interval=600, first=20, name="bridge-names")
+    app.job_queue.run_repeating(check_pending, interval=2, first=5, name="control-pending")
+    app.job_queue.run_repeating(sample_history, interval=30, first=15, name="history-sample")
+    app.job_queue.run_repeating(send_summaries, interval=30, first=40, name="daily-summary")
+    app.job_queue.run_repeating(purge_history, interval=86400, first=300, name="history-purge")
     if STORE.data.get("ui_version") != UI_VERSION:     # меню змінилося — один раз надсилаємо всім нову клавіатуру
         for chat_id, _ in STORE.all_users():
             try:
-                await app.bot.send_message(chat_id, "🔄 Бот оновився. Сповіщення тепер налаштовуються окремо для кожної людини й станції, "
-                                           "а за замовчуванням усі вимкнені: відкрий «🔔 Сповіщення» й увімкни потрібні. "
+                await app.bot.send_message(chat_id, "🔄 Бот оновився: тепер працюють «🎛 Керування» (виходи AC/DC/USB і максимальний заряд — для власників) "
+                                           "та «📈 Статистика». У «🔔 Сповіщення» з'явився щоденний підсумок дня. "
                                            "Інструкція — /help",
                                            reply_markup=menu_for(chat_id))
             except Exception as e:  # noqa: BLE001
@@ -1520,8 +1927,9 @@ async def post_init(app: Application) -> None:
 
 
 def main() -> None:
-    global STORE
+    global STORE, HISTORY
     STORE = bootstrap_store()
+    HISTORY = History(HISTORY_FILE)
     start_mqtt()
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", cmd_start))
@@ -1532,6 +1940,8 @@ def main() -> None:
     app.add_handler(CommandHandler("schedules", cmd_schedules))
     app.add_handler(CommandHandler("clear", cmd_clear))
     app.add_handler(CommandHandler("alerts", cmd_alerts))
+    app.add_handler(CommandHandler("control", cmd_control))
+    app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("rename", cmd_rename))
     app.add_handler(CommandHandler("devname", cmd_devname))
     app.add_handler(CommandHandler("invite", cmd_invite))

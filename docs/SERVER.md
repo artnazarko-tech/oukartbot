@@ -39,7 +39,9 @@ cd /root/oukitel-bot
 /root/oukitel-bot/
 ├── bot.py, Dockerfile, ...        ← из GitHub, обновляются автоматически
 ├── .env                           ← ТОКЕН БОТА и настройки (только тут!)
-├── data/schedules.json            ← расписания пользователей
+├── data/store.json                ← пользователи, роли, станции, настройки сповіщень
+├── data/history.db                ← история для статистики (SQLite; копить 400 дней)
+├── data/schedules.json            ← старые расписания (v1), нужны только для миграции
 ├── update.log                     ← журнал автообновлений
 └── oukitel-portable-bridge/
     └── config.json                ← ЛОГИН И ПАРОЛЬ Wonderfree (только тут!)
