@@ -314,6 +314,61 @@ def test_devname_flow_admin_only():
     S.set_device_name("main", "Oukitel P2001", "manual")
 
 
+def test_grid_detection_without_input_power():
+    g = bot.grid_signal
+    assert g({}) is None
+    assert g({"ac_input_watts": 450, "output_watts": 120, "battery": 60}) == "on"
+    assert g({"ac_input_watts": 20, "output_watts": 20, "battery": 100}) == "on"            # прохідне живлення з малим навантаженням
+    assert g({"ac_input_watts": 0, "output_watts": 120, "battery": 100}) == "off"           # живить від батареї
+    assert g({"ac_input_watts": 0, "output_watts": 0, "battery": 60, "ac_charging_limit": 100}) == "off"   # мала б заряджатися
+    # випадок зі скриншота: заряджена на 100%, нічого не споживає
+    assert g({"ac_input_watts": 0, "input_watts": 0, "output_watts": 0, "battery": 100, "ac_charging_limit": 100}) == "idle"
+    assert g({"ac_input_watts": 0, "output_watts": 0, "battery": 95}) == "idle"             # може бути пауза зарядки
+    assert g({"ac_input_watts": 0, "output_watts": 0, "battery": 80, "ac_charging_limit": 80}) == "idle"   # досягла свого ліміту
+    assert g({"input_watts": 300, "battery": 50}) == "on"                                   # немає ac_input_watts — беремо загальний вхід
+    # пам'ять: простій не змінює останній відомий стан
+    assert bot.grid_status_from({"ac_input_watts": 0, "output_watts": 0, "battery": 100}, None) == (True, False)
+    assert bot.grid_status_from({"ac_input_watts": 0, "output_watts": 0, "battery": 100}, False) == (False, False)
+    assert bot.grid_status_from({"ac_input_watts": 0, "output_watts": 50}, True) == (False, True)
+    st = bot.StationState()
+    base = "homeassistant/sensor/x"
+    for k, v in (("battery", b"100"), ("output_watts", b"0"), ("ac_input_watts", b"300")):
+        st.update(f"{base}/{k}", v, base)
+    assert st.grid_status() == (True, True)
+    st.update(f"{base}/ac_input_watts", b"0", base)          # зарядилась, простоює
+    assert st.grid_status() == (True, False)                 # пам'ятаємо, що мережа була
+    st.update(f"{base}/output_watts", b"80", base)           # з'явилось навантаження, входу немає
+    assert st.grid_status() == (False, True)
+    st.update(f"{base}/output_watts", b"0", base)            # навантаження зникло — все ще "немає"
+    assert st.grid_status() == (False, False)
+
+
+def test_grid_text_and_alerts_with_idle():
+    idle = {"battery": 100, "temperature": 29, "input_watts": 0, "ac_input_watts": 0, "output_watts": 0,
+            "hardware_fault_status": "Normal"}
+    assert "Мережа: ✅ є (ймовірно)" in bot.format_status(idle, time.time(), "X")
+    assert "ймовірно" in bot.format_detail(idle, time.time(), "X")
+    assert "Мережа: ✅ є\n" in bot.format_status(dict(idle, ac_input_watts=30), time.time(), "X")
+    # сповіщення: простій не вважається відключенням
+    bot.INPUT_DEBOUNCE_S = 0
+    app = MagicMock(); app.bot_data = {}
+    st = bot.state_of("dacha"); st.values = {}; st.updated = 0
+    base = "homeassistant/sensor/oukitel_dacha"
+    def feed(**kw):
+        for k, v in kw.items():
+            st.update(f"{base}/{k}", str(v).encode(), base)
+    feed(battery=100, ac_input_watts=0, output_watts=0)
+    assert not [m for m in bot.collect_alerts(app, "dacha") if "Живлення" in m]     # простій: тихо
+    assert app.bot_data["alert_state"]["dacha"]["grid_on"] is True                   # базова лінія: мережа є
+    feed(output_watts=60)                                                            # навантаження без входу
+    msgs = bot.collect_alerts(app, "dacha")
+    assert any("зникло" in m for m in msgs)
+    feed(output_watts=0)                                                             # знову простій — повторів нема
+    assert not [m for m in bot.collect_alerts(app, "dacha") if "Живлення" in m]
+    feed(ac_input_watts=200)
+    assert any("з'явилося" in m for m in bot.collect_alerts(app, "dacha"))
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

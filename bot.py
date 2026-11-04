@@ -54,7 +54,8 @@ MQTT_TOPIC_BASE = os.getenv("MQTT_TOPIC_BASE", "homeassistant/sensor/oukitel").r
 
 LOW_BATTERY = float(os.getenv("ALERT_LOW_BATTERY", "20"))
 FULL_BATTERY = float(os.getenv("ALERT_FULL_BATTERY", "100"))
-INPUT_ON_W = float(os.getenv("ALERT_INPUT_ON_W", "30"))      # вхід вважається "є" від цієї потужності
+GRID_MIN_W = float(os.getenv("GRID_MIN_W", "5"))      # вхід з мережі від цієї потужності точно означає «мережа є»
+GRID_LOAD_W = 10.0                                    # навантаження від цієї потужності при нульовому вході = «працюємо від батареї»
 INPUT_DEBOUNCE_S = int(os.getenv("ALERT_INPUT_DEBOUNCE_S", "60"))
 STALE_AFTER_S = int(os.getenv("STALE_AFTER_S", "300"))
 
@@ -80,7 +81,8 @@ class StationState:
         self.values: dict[str, object] = {}
         self.raw: dict[str, str] = {}
         self.updated: float = 0.0
-        self.meta: dict[str, str] = {}      # що міст повідомив про пристрій: name, model, serial
+        self.meta: dict[str, str] = {}      # що міст повідомив про пристрій: model, serial
+        self.grid_last: bool | None = None  # остання ВІДОМА наявність мережі (коли станція простоює, її не видно)
 
     def update(self, topic: str, payload: bytes, base: str) -> None:
         key = topic_to_key(topic, base)
@@ -97,6 +99,14 @@ class StationState:
             else:
                 self.values[key] = value
             self.updated = time.time()
+            sig = grid_signal(self.values)
+            if sig in ("on", "off"):
+                self.grid_last = sig == "on"
+
+    def grid_status(self) -> tuple[bool | None, bool]:
+        """(мережа є?, це точно?). None — даних немає."""
+        with self._lock:
+            return grid_status_from(self.values, self.grid_last)
 
     def snapshot(self) -> tuple[dict, float]:
         with self._lock:
@@ -233,14 +243,49 @@ def fault_list(values: dict) -> list[str]:
 
 
 def grid_watts(values: dict) -> float | None:
+    """Потужність входу саме з мережі (AC). Якщо мост її окремо не віддає — загальний вхід."""
     w = num(values, "ac_input_watts", "ac_input_power")
     return w if w is not None else num(values, "input_watts", "total_input_power")
 
 
-def grid_present(values: dict) -> bool | None:
-    """Є вхідне живлення з мережі? None — даних немає. (Прапорця «є мережа» міст не віддає, дивимось на потужність.)"""
-    w = grid_watts(values)
-    return None if w is None else w >= INPUT_ON_W
+def grid_signal(values: dict) -> str | None:
+    """Що можна сказати про мережу за поточними показниками станції:
+    'on' — точно є, 'off' — точно немає, 'idle' — заряджена й нічого не живить (за потужністю не відрізнити),
+    None — даних немає. Прапорця «є мережа» мост не віддає, тому міркуємо за потужністю."""
+    grid = grid_watts(values)
+    if grid is None:
+        return None
+    if grid >= GRID_MIN_W:
+        return "on"
+    tout = num(values, "output_watts", "total_output_power", "output_power")
+    if tout is not None and tout >= GRID_LOAD_W:
+        return "off"          # споживаємо, а входу немає: при живій мережі вхід був би не меншим за навантаження
+    bat = num(values, "battery", "battery_level", "soc")
+    limit = num(values, "ac_charging_limit") or 100.0
+    if bat is not None and bat < limit - 10:
+        return "off"          # при живій мережі станція вже заряджалась би
+    return "idle"
+
+
+def grid_status_from(values: dict, last_known: bool | None) -> tuple[bool | None, bool]:
+    """(є мережа?, достовірно?). У стані 'idle' беремо останній відомий стан,
+    а якщо його немає — вважаємо, що мережа є (повна батарея без споживання майже завжди означає живу мережу)."""
+    sig = grid_signal(values)
+    if sig is None:
+        return None, False
+    if sig == "idle":
+        return (True if last_known is None else last_known), False
+    return sig == "on", True
+
+
+def grid_line(grid: tuple[bool | None, bool], short: bool = True) -> str | None:
+    present, certain = grid
+    if present is None:
+        return None
+    word = "є" if present else "немає"
+    if short:
+        return f"Мережа: {'✅' if present else '❌'} {word}" + ("" if certain else " (ймовірно)")
+    return f"Мережа: {word}" + ("" if certain else " (ймовірно: станція заряджена й нічого не живить, точно визначити неможливо)")
 
 
 def updated_line(updated: float) -> tuple[str, str]:
@@ -253,15 +298,15 @@ def no_data(name: str) -> str:
     return f"⚡ <b>{name}</b>\n⏳ Даних від станції ще немає. Спробуй за хвилину."
 
 
-def format_status(values: dict, updated: float, name: str = "Станція") -> str:
+def format_status(values: dict, updated: float, name: str = "Станція", grid=None) -> str:
     """Короткий стан: з картинками, для швидкого погляду."""
     if not updated:
         return no_data(name)
     lines = [f"⚡ <b>{name}</b>"]
 
-    grid = grid_present(values)
-    if grid is not None:
-        lines.append("Мережа: ✅ є" if grid else "Мережа: ❌ немає")
+    gline = grid_line(grid if grid is not None else grid_status_from(values, None))
+    if gline:
+        lines.append(gline)
 
     bat = num(values, "battery", "battery_level", "soc")
     temp = num(values, "temperature", "temp")
@@ -301,15 +346,15 @@ def _onoff(v: str | None) -> str | None:
     return None if v is None else ("увімкнено" if v.upper() == "ON" else "вимкнено")
 
 
-def format_detail(values: dict, updated: float, name: str = "Станція") -> str:
+def format_detail(values: dict, updated: float, name: str = "Станція", grid=None) -> str:
     """Детальний стан: суха інформація без картинок."""
     if not updated:
         return no_data(name)
     L = [f"<b>{name}</b> — детальний стан", ""]
 
-    grid = grid_present(values)
-    if grid is not None:
-        L.append("Мережа: " + ("є" if grid else "немає"))
+    gline = grid_line(grid if grid is not None else grid_status_from(values, None), short=False)
+    if gline:
+        L.append(gline)
     bat = num(values, "battery", "battery_level", "soc")
     if bat is not None:
         L.append(f"Заряд батареї: {bat:.0f}%")
@@ -391,13 +436,15 @@ def esc(text: object) -> str:
 
 
 def status_text(dev_id: str, chat_id: int) -> str:
-    values, updated = state_of(dev_id).snapshot()
-    return format_status(values, updated, esc(STORE.label(chat_id, dev_id)))
+    st = state_of(dev_id)
+    values, updated = st.snapshot()
+    return format_status(values, updated, esc(STORE.label(chat_id, dev_id)), st.grid_status())
 
 
 def detail_text(dev_id: str, chat_id: int) -> str:
-    values, updated = state_of(dev_id).snapshot()
-    return format_detail(values, updated, esc(STORE.label(chat_id, dev_id)))
+    st = state_of(dev_id)
+    values, updated = st.snapshot()
+    return format_detail(values, updated, esc(STORE.label(chat_id, dev_id)), st.grid_status())
 
 
 def role_summary(chat_id: int, full: bool = False) -> str:
@@ -513,7 +560,7 @@ def alerts_view(chat_id: int) -> View:
         "🔔 <b>Сповіщення</b>\n\n"
         "Поки бот автоматично пише всім, хто має доступ до станції:\n"
         f"• заряд нижче {LOW_BATTERY:.0f}% і заряд {FULL_BATTERY:.0f}%\n"
-        "• світло з'явилося / зникло (за вхідною потужністю з мережі)\n"
+        "• світло з'явилося / зникло\n"
         "• помилки станції\n"
         f"• немає даних довше {STALE_AFTER_S // 60} хв\n\n"
         "Окремі налаштування для кожної людини — скоро."
@@ -1114,12 +1161,13 @@ def collect_alerts(app: Application, dev_id: str) -> list[str]:
         elif bat <= FULL_BATTERY - 5:
             st["full"] = False
 
-    # живлення з мережі (з затримкою, щоб не реагувати на короткі стрибки)
-    grid = num(values, "ac_input_watts", "ac_input_power")
-    if grid is None:
-        grid = num(values, "input_watts", "total_input_power")
-    if grid is not None:
-        on = grid >= INPUT_ON_W
+    # живлення з мережі (з затримкою, щоб не реагувати на короткі стрибки).
+    # Враховуємо лише достовірні ознаки; 'idle' (заряджена й простоює) стан не змінює.
+    sig = grid_signal(values)
+    if sig == "idle" and "grid_on" not in st:
+        st["grid_on"] = True                  # повна батарея без навантаження — вважаємо, що мережа є
+    if sig in ("on", "off"):
+        on = sig == "on"
         if "grid_on" not in st:
             st["grid_on"] = on
         elif on != st["grid_on"]:
@@ -1130,11 +1178,13 @@ def collect_alerts(app: Application, dev_id: str) -> list[str]:
                 ts = datetime.now(TZ).strftime("%H:%M")
                 bat_txt = f" Заряд: {bat:.0f}%." if bat is not None else ""
                 msgs.append(
-                    f"💡 Живлення з'явилося о {ts} (вхід {grid:.0f} Вт).{bat_txt}" if on
+                    f"💡 Живлення з'явилося о {ts}.{bat_txt}" if on
                     else f"🔌 Живлення зникло о {ts}. Працюємо від батареї.{bat_txt}"
                 )
         else:
             st.pop("grid_change_since", None)
+    elif sig == "idle":
+        st.pop("grid_change_since", None)     # простій перериває «відлік» зміни стану
 
     fault = values.get("hardware_fault_status")
     if isinstance(fault, str) and fault:
