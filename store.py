@@ -25,6 +25,11 @@ ROLE_TITLES = {ROLE_ADMIN: "Адмін", ROLE_OWNER: "Власник", ROLE_GUES
 
 INVITE_TTL_S = 48 * 3600
 
+# Сповіщення, які людина може вмикати окремо для кожної станції (за замовчуванням ВСІ вимкнені)
+NOTIFY_KEYS = ("light_on", "light_off", "full", "low", "error", "stale")
+DEFAULT_LOW_LEVEL = 20
+LOW_LEVELS = (10, 15, 20, 30, 40, 50)
+
 
 def _empty() -> dict:
     return {"version": 2, "devices": {}, "users": {}, "invites": {}}
@@ -218,6 +223,24 @@ class Store:
         if user is None:
             return {"times": [], "interval_min": 0}
         return user.setdefault("schedule", {"times": [], "interval_min": 0})
+
+    # ------------------------------------------------------------ сповіщення
+    def notify(self, chat_id: int, dev_id: str) -> dict:
+        """Налаштування сповіщень людини для станції: {'light_on': False, ..., 'low_level': 20}."""
+        saved = ((self.get_user(chat_id) or {}).get("notify") or {}).get(dev_id, {})
+        prefs = {k: bool(saved.get(k, False)) for k in NOTIFY_KEYS}
+        prefs["low_level"] = int(saved.get("low_level", DEFAULT_LOW_LEVEL))
+        return prefs
+
+    def set_notify(self, chat_id: int, dev_id: str, key: str, value) -> None:
+        if key not in NOTIFY_KEYS and key != "low_level":
+            raise ValueError(f"Невідоме сповіщення: {key}")
+        with self._lock:
+            user = self.get_user(chat_id)
+            if user is None:
+                return
+            user.setdefault("notify", {}).setdefault(dev_id, {})[key] = int(value) if key == "low_level" else bool(value)
+            self.save()
 
     # ------------------------------------------------------------ запрошення
     def create_invite(self, role: str, devices: list[str], created_by: int, ttl: int = INVITE_TTL_S) -> str:

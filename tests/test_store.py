@@ -95,6 +95,25 @@ def test_old_store_gets_indexes():
     assert sorted(d["index"] for d in s2.devices().values()) == [1, 2]
 
 
+def test_notify_defaults_and_set():
+    s = fresh()
+    s.add_user(2, "Мама")
+    p = s.notify(2, "main")
+    assert p["low_level"] == 20 and not any(p[k] for k in ("light_on", "light_off", "full", "low", "error", "stale"))
+    s.set_notify(2, "main", "light_off", True)
+    s.set_notify(2, "main", "low_level", 30)
+    s.set_notify(2, "mama", "full", True)                         # на іншій станції — окремо
+    s2 = Store(s.path)
+    assert s2.notify(2, "main")["light_off"] and s2.notify(2, "main")["low_level"] == 30
+    assert not s2.notify(2, "mama")["light_off"] and s2.notify(2, "mama")["full"]
+    assert s2.notify(99, "main")["low_level"] == 20               # невідомий — значення за замовчуванням
+    try:
+        s.set_notify(2, "main", "bogus", True)
+        raise AssertionError("мало бути помилкою")
+    except ValueError:
+        pass
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

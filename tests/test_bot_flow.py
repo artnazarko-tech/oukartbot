@@ -133,21 +133,23 @@ def test_two_devices_routing_and_alerts():
     upd, ctx = make_update(555, data="dev:status:mama")
     run(bot.on_button(upd, ctx))
     upd.callback_query.answer.assert_called_with("⛔ Немає доступу до цієї станції")
-    # алерты по устройству независимы
-    app = MagicMock(); app.bot_data = {}
-    msgs = bot.collect_alerts(app, "mama")
-    assert any("Низький заряд" in m for m in msgs)
-    assert not any("Низький" in m for m in bot.collect_alerts(app, "main"))
 
 
 def test_alert_recipients_and_prefix():
     app = MagicMock(); app.bot_data = {}; app.bot.send_message = AsyncMock()
     ctx = SimpleNamespace(application=app)
-    bot.state_of("mama").update("homeassistant/sensor/oukitel_mama/battery", b"10", "homeassistant/sensor/oukitel_mama")
+    base = "homeassistant/sensor/oukitel_mama"
+    bot.state_of("mama").update(f"{base}/battery", b"50", base)
+    run(bot.check_alerts(ctx))
+    app.bot.send_message.assert_not_called()                              # за замовчуванням усе вимкнено
+    S.set_notify(1, "mama", "low", True)
+    run(bot.check_alerts(ctx))                                            # вмикання — без миттєвого повідомлення
+    app.bot.send_message.assert_not_called()
+    bot.state_of("mama").update(f"{base}/battery", b"10", base)
     run(bot.check_alerts(ctx))
     sent = [(c[0][0], c[0][1]) for c in app.bot.send_message.call_args_list]
-    assert any(cid == 1 and "Мама" in t for cid, t in sent)              # админ получил с подписью станции
-    assert not any(cid == 555 for cid, _ in sent)                        # у 555 доступа к mama уже нет
+    assert any(cid == 1 and "Мама" in t and "знизився до <b>10%" in t for cid, t in sent)   # адмін, з підписом станції
+    assert not any(cid == 555 for cid, _ in sent)                         # у 555 доступу до mama вже немає
 
 
 def test_start_and_help_texts():
@@ -357,16 +359,108 @@ def test_grid_text_and_alerts_with_idle():
     def feed(**kw):
         for k, v in kw.items():
             st.update(f"{base}/{k}", str(v).encode(), base)
+    kinds = lambda: [k for k, _ in bot.device_events(app, "dacha")]            # noqa: E731
     feed(battery=100, ac_input_watts=0, output_watts=0)
-    assert not [m for m in bot.collect_alerts(app, "dacha") if "Живлення" in m]     # простій: тихо
+    assert not {"light_on", "light_off"} & set(kinds())                              # простій: тихо
     assert app.bot_data["alert_state"]["dacha"]["grid_on"] is True                   # базова лінія: мережа є
     feed(output_watts=60)                                                            # навантаження без входу
-    msgs = bot.collect_alerts(app, "dacha")
-    assert any("зникло" in m for m in msgs)
+    assert "light_off" in kinds()
     feed(output_watts=0)                                                             # знову простій — повторів нема
-    assert not [m for m in bot.collect_alerts(app, "dacha") if "Живлення" in m]
+    assert not {"light_on", "light_off"} & set(kinds())
     feed(ac_input_watts=200)
-    assert any("з'явилося" in m for m in bot.collect_alerts(app, "dacha"))
+    assert "light_on" in kinds()
+
+
+def _collect(app):
+    return [(c[0][0], c[0][1]) for c in app.bot.send_message.call_args_list]
+
+
+def test_notification_settings_screens():
+    labels = lambda kb: [b.text for row in kb.inline_keyboard for b in row]      # noqa: E731
+    text, kb = bot.alerts_view(1)                                                 # у адміна кілька станцій
+    assert "Для якої станції" in text and "nt:main" in _buttons(kb)
+    upd, ctx = make_update(1, data="nt:main")
+    run(bot.on_button(upd, ctx))
+    assert "Усі сповіщення вимкнені" in edited(upd)
+    kb = upd.callback_query.edit_message_text.call_args[1]["reply_markup"]
+    assert "⬜ Світло з'явилося" in labels(kb) and "⬜ Заряд станції 20%" in labels(kb)
+    assert [b for b in labels(kb) if b.endswith("%") and b[0] in "1234●"][:3] == ["10%", "15%", "● 20%"]
+    upd, ctx = make_update(1, data="nt:main:light_off")
+    run(bot.on_button(upd, ctx))
+    assert "✅ Світло зникло" in edited(upd)
+    upd, ctx = make_update(1, data="nl:main:30")
+    run(bot.on_button(upd, ctx))
+    assert S.notify(1, "main")["low_level"] == 30 and "⬜ Заряд станції 30%" in labels(
+        upd.callback_query.edit_message_text.call_args[1]["reply_markup"])
+    run(bot.on_button(*make_update(1, data="nl:main:99")))                       # невірний поріг ігнорується
+    assert S.notify(1, "main")["low_level"] == 30
+    run(bot.on_button(*make_update(1, data="nt:main:bogus")))                    # невідомий ключ — нічого не міняє
+    upd, ctx = make_update(555, data="nt:mama:full")
+    run(bot.on_button(upd, ctx))
+    upd.callback_query.answer.assert_called_with("⛔ Немає доступу до цієї станції")
+    S.set_notify(1, "main", "light_off", False)
+
+
+def test_event_fanout_antispam_and_per_user_low():
+    S.add_device("t1", "T1", "homeassistant/sensor/t1")
+    S.set_access(555, "t1", "guest")
+    for k in ("light_on", "light_off", "full", "error", "stale", "low"):
+        S.set_notify(1, "t1", k, True)
+    S.set_notify(555, "t1", "full", True)
+    S.set_notify(555, "t1", "low", True); S.set_notify(555, "t1", "low_level", 15)
+    S.set_notify(1, "t1", "low_level", 30)
+    bot.INPUT_DEBOUNCE_S = 0
+    app = MagicMock(); app.bot_data = {}; app.bot.send_message = AsyncMock()
+    ctx = SimpleNamespace(application=app)
+    base = "homeassistant/sensor/t1"
+    st = bot.state_of("t1")
+    feed = lambda **kw: [st.update(f"{base}/{k}", str(v).encode(), base) for k, v in kw.items()]   # noqa: E731
+
+    def step(**kw):
+        app.bot.send_message.reset_mock()
+        feed(**kw)
+        run(bot.check_alerts(ctx))
+        return {cid: t for cid, t in _collect(app) if "T1" in t}
+
+    got = step(battery=100, ac_input_watts=300, output_watts=0, hardware_fault_status="Normal")
+    assert "заряджено" in got[1] and "заряджено" in got[555]                         # обидва підписані на «заряджена»
+    assert step(battery=98) == {} and step(battery=100) == {}                        # цикли ДБЖ 98↔100 — без спаму
+    assert step(battery=94) == {}
+    assert "заряджено" in step(battery=100)[1]                                       # впала до 94% → знову взведено
+
+    # відключення світла: 555 про нього не просив
+    got = step(ac_input_watts=0, output_watts=100, remain_time=380)
+    assert "Світло зникло" in got[1] and "6 год 20 хв" in got[1] and 555 not in got
+    assert step(battery=100) == {}                                                   # на батареї 100% — не «заряджена»
+    assert step(battery=96) == {}                                                    # після відключення взводиться вже на 97%
+    app.bot_data["alert_state"]["t1"]["off_since"] = time.time() - 8100
+    got = step(ac_input_watts=200, output_watts=0)
+    assert "Світло з'явилося" in got[1] and "Світла не було 2 год 15 хв" in got[1]
+    assert "заряджено" not in step(battery=99).get(1, "")
+    assert "заряджено" in step(battery=100)[1]                                       # знову заряджена — сповіщення є
+    assert bot.fmt_duration(30) == "менше хвилини" and bot.fmt_duration(8100) == "2 год 15 хв"
+
+    # помилки
+    assert "Помилка станції: <b>Спрацював захист" in step(hardware_fault_status="Overload Protection")[1]
+    assert step(hardware_fault_status="Overload Protection") == {}                  # без повторів
+    assert "Помилку усунуто" in step(hardware_fault_status="Normal")[1]
+
+    # низький заряд: у кожного свій поріг (адмін 30%, 555 — 15%), повтор лише після підйому на 5%
+    for who in (1, 555):                                                             # перемикач порога скидає стан без повідомлення
+        S.set_notify(who, "t1", "low_level", S.notify(who, "t1")["low_level"])
+    assert step(battery=50) == {}
+    got = step(battery=28)
+    assert "знизився до <b>28%" in got[1] and 555 not in got
+    assert "знизився до <b>14%" in step(battery=14)[555] and 1 not in step(battery=13)
+    assert step(battery=36) == {}                                                    # адмін знову «взведений» (≥35)
+    assert "знизився до <b>29%" in step(battery=29)[1]
+
+    # немає даних
+    st.updated = time.time() - 1000
+    app.bot.send_message.reset_mock(); run(bot.check_alerts(ctx))
+    assert "немає даних уже" in dict(_collect(app))[1] and 555 not in dict(_collect(app))
+    assert "Зв'язок зі станцією відновлено" in step(battery=60)[1]
+    S.set_access(555, "t1", None)
 
 
 if __name__ == "__main__":

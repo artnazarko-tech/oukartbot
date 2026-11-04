@@ -36,7 +36,7 @@ from telegram.error import BadRequest
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
                           ContextTypes, MessageHandler, filters)
 
-from store import (ROLE_ADMIN, ROLE_GUEST, ROLE_OWNER, ROLE_TITLES, Store,
+from store import (LOW_LEVELS, NOTIFY_KEYS, ROLE_ADMIN, ROLE_GUEST, ROLE_OWNER, ROLE_TITLES, Store,
                    import_legacy_schedules)
 
 load_dotenv()
@@ -52,7 +52,6 @@ MQTT_USER = os.getenv("MQTT_USER") or None
 MQTT_PASSWORD = os.getenv("MQTT_PASSWORD") or None
 MQTT_TOPIC_BASE = os.getenv("MQTT_TOPIC_BASE", "homeassistant/sensor/oukitel").rstrip("/")
 
-LOW_BATTERY = float(os.getenv("ALERT_LOW_BATTERY", "20"))
 FULL_BATTERY = float(os.getenv("ALERT_FULL_BATTERY", "100"))
 GRID_MIN_W = float(os.getenv("GRID_MIN_W", "5"))      # вхід з мережі від цієї потужності точно означає «мережа є»
 GRID_LOAD_W = 10.0                                    # навантаження від цієї потужності при нульовому вході = «працюємо від батареї»
@@ -65,7 +64,7 @@ DEFAULT_DEVICE_ID = "main"
 DEFAULT_DEVICE_NAME = os.getenv("DEVICE_NAME", "Станція")   # тимчасова назва, поки справжню не знайдено
 # Журнал(и) моста: звідти береться справжня назва станції (міст пише її лише в лог, не в MQTT)
 BRIDGE_LOG_FILES = [p.strip() for p in os.getenv("BRIDGE_LOG_FILES", "/bridge/oukitel_bridge.log").split(",") if p.strip()]
-UI_VERSION = 2   # при зміні меню бот один раз надсилає всім нову клавіатуру
+UI_VERSION = 3   # при зміні меню/важливих правил бот один раз повідомляє про це всіх
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
 log = logging.getLogger("oukitel-bot")
@@ -555,17 +554,52 @@ def detail_view(dev_id: str, chat_id: int) -> View:
     return detail_text(dev_id, chat_id), kb
 
 
+NOTIFY_TITLES = {
+    "light_on": "Світло з'явилося",
+    "light_off": "Світло зникло",
+    "full": "Станція заряджена",
+    "error": "Помилка станції",
+    "stale": f"Немає даних довше {STALE_AFTER_S // 60} хв",
+}
+
+
+def notify_title(key: str, prefs: dict) -> str:
+    return f"Заряд станції {prefs['low_level']}%" if key == "low" else NOTIFY_TITLES[key]
+
+
 def alerts_view(chat_id: int) -> View:
+    """«Сповіщення»: одна станція — одразу її налаштування, кілька — спочатку вибір."""
+    devs = STORE.devices_for(chat_id)
+    if not devs:
+        return "У тебе поки немає доступу до жодної станції. Попроси адміна.", InlineKeyboardMarkup([[HOME]])
+    if len(devs) == 1:
+        return notify_view(devs[0], chat_id)
+    rows = [[B(STORE.label(chat_id, d), callback_data=f"nt:{d}")] for d in devs]
+    rows.append([B("⏰ Розклад звітів", callback_data="sch:open")])
+    rows.append([HOME])
+    return "🔔 <b>Сповіщення</b>\n\nДля якої станції налаштувати?", InlineKeyboardMarkup(rows)
+
+
+def notify_view(dev_id: str, chat_id: int) -> View:
+    prefs = STORE.notify(chat_id, dev_id)
+    on = [notify_title(k, prefs) for k in NOTIFY_KEYS if prefs[k]]
+    current = "\n".join(f"✅ {t}" for t in on) if on else "Усі сповіщення вимкнені."
     text = (
-        "🔔 <b>Сповіщення</b>\n\n"
-        "Поки бот автоматично пише всім, хто має доступ до станції:\n"
-        f"• заряд нижче {LOW_BATTERY:.0f}% і заряд {FULL_BATTERY:.0f}%\n"
-        "• світло з'явилося / зникло\n"
-        "• помилки станції\n"
-        f"• немає даних довше {STALE_AFTER_S // 60} хв\n\n"
-        "Окремі налаштування для кожної людини — скоро."
+        f"🔔 <b>Сповіщення — {esc(STORE.label(chat_id, dev_id))}</b>\n\n"
+        f"<b>Зараз увімкнено:</b>\n{current}\n\n"
+        "Натисни на сповіщення, щоб увімкнути чи вимкнути його. "
+        "Для заряду нижче обери поріг — коли попереджати."
     )
-    return text, InlineKeyboardMarkup([[B("⏰ Розклад звітів", callback_data="sch:open")], [HOME]])
+    rows = []
+    for key in NOTIFY_KEYS:
+        rows.append([B(("✅ " if prefs[key] else "⬜ ") + notify_title(key, prefs), callback_data=f"nt:{dev_id}:{key}")])
+        if key == "low":
+            rows.append([B(("● " if prefs["low_level"] == lvl else "") + f"{lvl}%", callback_data=f"nl:{dev_id}:{lvl}")
+                         for lvl in LOW_LEVELS])
+    rows.append([B("⏰ Розклад звітів", callback_data="sch:open")])
+    back = "m:alerts" if len(STORE.devices_for(chat_id)) > 1 else "m:main"
+    rows.append([B("⬅️ Назад", callback_data=back), HOME])
+    return text, InlineKeyboardMarkup(rows)
 
 
 def soon_view(title: str) -> View:
@@ -627,9 +661,11 @@ HELP_COMMON = (
     "Кнопка «📋 Детальний стан» показує докладніше: частоту, порти, версії тощо. «🔄 Оновити» бере свіжі дані.\n\n"
     "✏️ <b>Назва</b> — кнопка під станом (або /rename). Можна назвати станцію зручно, наприклад «Дача». "
     "Нову назву бачиш тільки ти.\n\n"
-    "🔔 <b>Сповіщення</b> — що бот пише сам: світло з'явилося чи зникло, низький і повний заряд, "
-    "помилки станції, немає зв'язку. Там же «⏰ Розклад звітів»: бот сам надсилатиме стан у потрібний час "
-    "або кожні кілька хвилин (свій час: /schedule 08:30).\n\n"
+    "🔔 <b>Сповіщення</b> — що бот має писати сам. Спочатку всі вимкнені: обери станцію й увімкни потрібне — "
+    "світло з'явилося чи зникло (з тим, скільки світла не було), станція заряджена, заряд упав до порога "
+    "(поріг обираєш сам), помилка станції, немає даних. Налаштування окремі для кожної людини й станції. "
+    "Там же «⏰ Розклад звітів»: бот сам надсилатиме стан у потрібний час або кожні кілька хвилин "
+    "(свій час: /schedule 08:30).\n\n"
     "🎛 <b>Керування</b> і 📈 <b>Статистика</b> — скоро."
 )
 HELP_ADMIN = (
@@ -1021,6 +1057,25 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await query.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
             return
 
+        # --- налаштування сповіщень: nt:<станція> — відкрити, nt:<станція>:<ключ> — перемкнути, nl:<станція>:<поріг>
+        if data.startswith(("nt:", "nl:")):
+            _, dev_id, *rest = data.split(":")
+            if not STORE.role(chat_id, dev_id):
+                await query.answer("⛔ Немає доступу до цієї станції")
+                return
+            if data.startswith("nt:") and rest and rest[0] in NOTIFY_KEYS:
+                prefs = STORE.notify(chat_id, dev_id)
+                STORE.set_notify(chat_id, dev_id, rest[0], not prefs[rest[0]])
+                await query.answer("Увімкнено" if not prefs[rest[0]] else "Вимкнено")
+            elif data.startswith("nl:") and rest and rest[0].isdigit() and int(rest[0]) in LOW_LEVELS:
+                STORE.set_notify(chat_id, dev_id, "low_level", int(rest[0]))
+                await query.answer(f"Поріг: {rest[0]}%")
+            else:
+                await query.answer()
+            text, kb = notify_view(dev_id, chat_id)
+            await query.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
+            return
+
         # --- назва станції: ren: — особиста, dn: — офіційна (лише адмін)
         if data.startswith(("ren:", "dn:")):
             official = data.startswith("dn:")
@@ -1129,40 +1184,46 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ---------------------------------------------------------------- сповіщення
-def collect_alerts(app: Application, dev_id: str) -> list[str]:
-    """Порівнює поточний стан пристрою з попереднім і повертає список нових повідомлень."""
+def fmt_duration(seconds: float) -> str:
+    m = int(seconds // 60)
+    if m < 1:
+        return "менше хвилини"
+    h, mm = divmod(m, 60)
+    return f"{h} год {mm:02d} хв" if h else f"{mm} хв"
+
+
+def device_events(app: Application, dev_id: str) -> list[tuple[str, dict]]:
+    """Порівнює поточний стан станції з попереднім і повертає ПОДІЇ (одні для всіх людей).
+    Кому саме їх надсилати — вирішує check_alerts за налаштуваннями кожної людини."""
     st = app.bot_data.setdefault("alert_state", {}).setdefault(dev_id, {})
     values, updated = state_of(dev_id).snapshot()
-    msgs: list[str] = []
+    events: list[tuple[str, dict]] = []
     now = time.time()
 
     # немає даних
     if not updated:
-        return msgs
+        return events
     stale = now - updated > STALE_AFTER_S
     if stale and not st.get("stale"):
-        msgs.append(f"📡 Від станції немає даних уже {int((now - updated) // 60)} хв")
+        events.append(("stale", {"minutes": int((now - updated) // 60)}))
     elif not stale and st.get("stale"):
-        msgs.append("📡 Зв'язок зі станцією відновлено")
+        events.append(("stale_back", {}))
     st["stale"] = stale
     if stale:
-        return msgs
+        return events
 
     bat = num(values, "battery", "battery_level", "soc")
     if bat is not None:
-        if bat <= LOW_BATTERY and not st.get("low"):
-            msgs.append(f"🪫 Низький заряд: <b>{bat:.0f}%</b>")
-            st["low"] = True
-        elif bat >= LOW_BATTERY + 5:
-            st["low"] = False
+        # «Станція заряджена»: спрацьовує один раз і знову «взводиться» лише після падіння до 95%
+        # (або до 97% після відключення світла) — тож цикли 98→100% у режимі ДБЖ не дають спаму
         if bat >= FULL_BATTERY and not st.get("full"):
-            msgs.append(f"🔋 Станцію заряджено: <b>{bat:.0f}%</b>")
+            events.append(("full", {"bat": bat}))
             st["full"] = True
-        elif bat <= FULL_BATTERY - 5:
-            st["full"] = False
+            st["outage_since_full"] = False
+        elif st.get("full") and bat <= FULL_BATTERY - (3 if st.get("outage_since_full") else 5):
+            st["full"] = False        # після відключення світла достатньо впасти до 97%, інакше — до 95%
 
-    # живлення з мережі (з затримкою, щоб не реагувати на короткі стрибки).
-    # Враховуємо лише достовірні ознаки; 'idle' (заряджена й простоює) стан не змінює.
+    # світло: враховуємо лише достовірні ознаки; 'idle' (заряджена й простоює) стан не змінює
     sig = grid_signal(values)
     if sig == "idle" and "grid_on" not in st:
         st["grid_on"] = True                  # повна батарея без навантаження — вважаємо, що мережа є
@@ -1172,27 +1233,68 @@ def collect_alerts(app: Application, dev_id: str) -> list[str]:
             st["grid_on"] = on
         elif on != st["grid_on"]:
             since = st.setdefault("grid_change_since", now)
-            if now - since >= INPUT_DEBOUNCE_S:
+            if now - since >= INPUT_DEBOUNCE_S:       # затримка, щоб не реагувати на короткі стрибки
                 st["grid_on"] = on
                 st.pop("grid_change_since", None)
-                ts = datetime.now(TZ).strftime("%H:%M")
-                bat_txt = f" Заряд: {bat:.0f}%." if bat is not None else ""
-                msgs.append(
-                    f"💡 Живлення з'явилося о {ts}.{bat_txt}" if on
-                    else f"🔌 Живлення зникло о {ts}. Працюємо від батареї.{bat_txt}"
-                )
+                tout = num(values, "output_watts", "total_output_power", "output_power")
+                remain = num(values, "remain_time", "remaining_discharge_time")
+                if on:
+                    began = st.pop("off_since", None)
+                    events.append(("light_on", {"bat": bat, "outage_s": now - began if began else None}))
+                else:
+                    st["off_since"] = since
+                    st["outage_since_full"] = True     # було відключення: «заряджена» знову спрацює вже після спаду до 97%
+                    left = fmt_minutes(remain) if tout and tout > 0 and remain else None
+                    events.append(("light_off", {"bat": bat, "left": left if left != "—" else None}))
         else:
             st.pop("grid_change_since", None)
     elif sig == "idle":
-        st.pop("grid_change_since", None)     # простій перериває «відлік» зміни стану
+        st.pop("grid_change_since", None)         # простій перериває «відлік» зміни стану
 
-    fault = values.get("hardware_fault_status")
-    if isinstance(fault, str) and fault:
-        if fault.lower() != "normal" and st.get("fault") != fault:
-            msgs.append(f"⚠️ Станція повідомляє: <b>{fault}</b>")
-        st["fault"] = fault if fault.lower() != "normal" else None
+    # помилки
+    fault = fault_list(values)
+    text = "; ".join(fault)
+    if text and st.get("fault") != text:
+        events.append(("error", {"text": text}))
+    elif not text and st.get("fault"):
+        events.append(("error_clear", {}))
+    st["fault"] = text or None
 
-    return msgs
+    return events
+
+
+# яка подія керується яким перемикачем у налаштуваннях людини
+EVENT_SETTING = {"stale_back": "stale", "error_clear": "error"}
+
+
+def render_event(kind: str, d: dict) -> str:
+    ts = datetime.now(TZ).strftime("%H:%M")
+    bat = f" Заряд: {d['bat']:.0f}%." if d.get("bat") is not None else ""
+    if kind == "light_on":
+        out = f" Світла не було {fmt_duration(d['outage_s'])}." if d.get("outage_s") and d["outage_s"] >= 60 else ""
+        return f"💡 Світло з'явилося о {ts}.{out}{bat}"
+    if kind == "light_off":
+        left = f" Вистачить приблизно на {d['left']}." if d.get("left") else ""
+        return f"🔌 Світло зникло о {ts}. Працюємо від батареї.{bat}{left}"
+    if kind == "full":
+        return f"🔋 Станцію заряджено: <b>{d['bat']:.0f}%</b>"
+    if kind == "error":
+        return f"⚠️ Помилка станції: <b>{esc(d['text'])}</b>"
+    if kind == "error_clear":
+        return "✅ Помилку усунуто"
+    if kind == "stale":
+        return f"📡 Від станції немає даних уже {d['minutes']} хв"
+    if kind == "stale_back":
+        return "📡 Зв'язок зі станцією відновлено"
+    raise ValueError(kind)
+
+
+def low_battery_text(bat: float, level: int, values: dict) -> str:
+    tout = num(values, "output_watts", "total_output_power", "output_power")
+    remain = num(values, "remain_time", "remaining_discharge_time")
+    left = fmt_minutes(remain) if tout and tout > 0 and remain else "—"
+    tail = f" Вистачить приблизно на {left}." if left != "—" else ""
+    return f"🪫 Заряд станції знизився до <b>{bat:.0f}%</b> (поріг {level}%).{tail}"
 
 
 async def check_alerts(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1205,16 +1307,35 @@ async def check_alerts(context: ContextTypes.DEFAULT_TYPE) -> None:
                     await app.bot.send_message(cid, notice, parse_mode="HTML")
                 except Exception as e:  # noqa: BLE001
                     log.warning("Не вдалося надіслати в %s: %s", cid, e)
-    devices = STORE.devices()
-    for dev_id, info in devices.items():
-        msgs = collect_alerts(app, dev_id)
-        if not msgs:
-            continue
-        body = "\n".join(msgs)
+
+    for dev_id in STORE.devices():
+        events = device_events(app, dev_id)
+        st = app.bot_data["alert_state"].setdefault(dev_id, {})
+        values, _ = state_of(dev_id).snapshot()
+        bat = num(values, "battery", "battery_level", "soc")
+        lows = st.setdefault("low", {})        # окремий стан «низького заряду» для кожної людини: у всіх свій поріг
+
         for chat_id in STORE.users_for_device(dev_id):
-            text = body
+            prefs = STORE.notify(chat_id, dev_id)
+            texts = [render_event(kind, data) for kind, data in events if prefs.get(EVENT_SETTING.get(kind, kind))]
+
+            if not prefs["low"]:
+                lows.pop(chat_id, None)        # вимкнено — забуваємо стан, щоб при вмиканні не було зайвого повідомлення
+            elif bat is not None and not st.get("stale"):
+                level, rec = prefs["low_level"], lows.get(chat_id)
+                if rec is None or rec["level"] != level:
+                    lows[chat_id] = {"level": level, "fired": bat <= level}   # вмикання/зміна порогу — без миттєвого сповіщення
+                elif bat <= level and not rec["fired"]:
+                    texts.append(low_battery_text(bat, level, values))
+                    rec["fired"] = True
+                elif bat >= level + 5:
+                    rec["fired"] = False       # знову «взведено»: заряд піднявся на 5% вище порога
+
+            if not texts:
+                continue
+            text = "\n".join(texts)
             if len(STORE.devices_for(chat_id)) > 1:   # у людини кілька станцій — підписуємо, про яку мова
-                text = f"<b>{esc(STORE.label(chat_id, dev_id))}</b>\n{body}"
+                text = f"<b>{esc(STORE.label(chat_id, dev_id))}</b>\n{text}"
             try:
                 await app.bot.send_message(chat_id, text, parse_mode="HTML")
             except Exception as e:  # noqa: BLE001
@@ -1331,7 +1452,9 @@ async def post_init(app: Application) -> None:
     if STORE.data.get("ui_version") != UI_VERSION:     # меню змінилося — один раз надсилаємо всім нову клавіатуру
         for chat_id, _ in STORE.all_users():
             try:
-                await app.bot.send_message(chat_id, "🔄 Бот оновився: змінилося меню внизу. Інструкція — /help",
+                await app.bot.send_message(chat_id, "🔄 Бот оновився. Сповіщення тепер налаштовуються окремо для кожної людини й станції, "
+                                           "а за замовчуванням усі вимкнені: відкрий «🔔 Сповіщення» й увімкни потрібні. "
+                                           "Інструкція — /help",
                                            reply_markup=menu_for(chat_id))
             except Exception as e:  # noqa: BLE001
                 log.warning("Не вдалося оновити меню в %s: %s", chat_id, e)
