@@ -27,8 +27,11 @@ from zoneinfo import ZoneInfo
 
 import paho.mqtt.client as mqtt
 from dotenv import load_dotenv
-from telegram import BotCommand, Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import (BotCommand, InlineKeyboardButton, InlineKeyboardMarkup,
+                      KeyboardButton, ReplyKeyboardMarkup, Update)
+from telegram.error import BadRequest
+from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
+                          ContextTypes, MessageHandler, filters)
 
 load_dotenv()
 
@@ -253,15 +256,15 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.application.bot_data.setdefault("seen_chats", set()).add(chat_id)
     await update.message.reply_text(
         "👋 Я стежу за зарядною станцією Oukitel.\n\n"
+        "Користуйся кнопками внизу 👇\n\n"
+        "Команди теж працюють:\n"
         "/status — поточний стан\n"
-        "/schedule 08:00 — щоденний звіт (можна додати кілька часів)\n"
-        "/every 60 — звіт кожні N хвилин (0 — вимкнути)\n"
-        "/schedules — мій розклад\n"
-        "/clear — очистити розклад\n"
-        "/alerts — автоматичні сповіщення\n"
+        "/schedule 08:00 — щоденний звіт у свій час\n"
+        "/every 60 — звіт кожні N хвилин\n"
         "/debug — сирі дані MQTT\n\n"
         f"Твій chat_id: <code>{chat_id}</code>",
         parse_mode="HTML",
+        reply_markup=MAIN_MENU,
     )
 
 
@@ -269,7 +272,8 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not allowed(update):
         return
     values, updated = STATE.snapshot()
-    await update.message.reply_text(format_status(values, updated), parse_mode="HTML")
+    await update.message.reply_text(format_status(values, updated), parse_mode="HTML",
+                                    reply_markup=STATUS_KB)
 
 
 async def cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -369,6 +373,131 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = "\n".join(lines)
     for i in range(0, len(text), 3800):
         await update.message.reply_text(text[i:i + 3800])
+
+
+# ---------------------------------------------------------------- кнопки
+BTN_STATUS = "📊 Стан"
+BTN_SCHEDULE = "⏰ Розклад"
+BTN_ALERTS = "🔔 Сповіщення"
+BTN_HELP = "ℹ️ Допомога"
+
+# Постійне меню внизу екрана (замість клавіатури)
+MAIN_MENU = ReplyKeyboardMarkup(
+    [[KeyboardButton(BTN_STATUS)], [KeyboardButton(BTN_SCHEDULE), KeyboardButton(BTN_ALERTS)],
+     [KeyboardButton(BTN_HELP)]],
+    resize_keyboard=True,
+    is_persistent=True,
+)
+
+# Кнопка під повідомленням зі станом
+STATUS_KB = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Оновити", callback_data="status:refresh")]])
+
+PRESET_TIMES = ["07:00", "09:00", "12:00", "15:00", "18:00", "21:00", "23:00"]
+PRESET_INTERVALS = [(0, "вимк"), (30, "30 хв"), (60, "1 год"), (180, "3 год")]
+
+
+def get_cfg(app: Application, chat_id: int) -> dict:
+    return app.bot_data["schedules"].setdefault(str(chat_id), {"times": [], "interval_min": 0})
+
+
+def schedule_text(cfg: dict) -> str:
+    times = ", ".join(cfg.get("times") or []) or "немає"
+    interval = cfg.get("interval_min") or 0
+    every = f"кожні {interval} хв" if interval else "вимкнено"
+    return (
+        "⏰ <b>Розклад звітів</b>\n\n"
+        f"🕗 Щодня о: <b>{times}</b>\n"
+        f"🔁 Періодично: <b>{every}</b>\n\n"
+        "Натискай на час, щоб увімкнути ✅ або вимкнути його.\n"
+        "Свій час: <code>/schedule 08:30</code>"
+    )
+
+
+def schedule_kb(cfg: dict) -> InlineKeyboardMarkup:
+    chosen = set(cfg.get("times") or [])
+    time_btns = [
+        InlineKeyboardButton(("✅ " if t in chosen else "") + t, callback_data=f"sch:t:{t}")
+        for t in PRESET_TIMES
+    ]
+    rows = [time_btns[i:i + 4] for i in range(0, len(time_btns), 4)]
+    # нестандартні часи, додані командою, теж показуємо, щоб їх можна було прибрати
+    custom = [t for t in sorted(chosen) if t not in PRESET_TIMES]
+    if custom:
+        rows.append([InlineKeyboardButton(f"✅ {t}", callback_data=f"sch:t:{t}") for t in custom][:4])
+    cur = cfg.get("interval_min") or 0
+    rows.append([
+        InlineKeyboardButton(("● " if cur == m else "") + label, callback_data=f"sch:i:{m}")
+        for m, label in PRESET_INTERVALS
+    ])
+    rows.append([InlineKeyboardButton("🗑 Очистити все", callback_data="sch:clear")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def show_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not allowed(update):
+        return
+    cfg = get_cfg(context.application, update.effective_chat.id)
+    await update.message.reply_text(schedule_text(cfg), parse_mode="HTML", reply_markup=schedule_kb(cfg))
+
+
+async def on_menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обробка натискань на кнопки нижнього меню."""
+    if not allowed(update):
+        return
+    text = update.message.text
+    if text == BTN_STATUS:
+        await cmd_status(update, context)
+    elif text == BTN_SCHEDULE:
+        await show_schedule(update, context)
+    elif text == BTN_ALERTS:
+        await cmd_alerts(update, context)
+    elif text == BTN_HELP:
+        await cmd_start(update, context)
+
+
+async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обробка натискань на кнопки під повідомленнями."""
+    query = update.callback_query
+    if not allowed(update):
+        await query.answer("⛔ Немає доступу")
+        return
+    data = query.data or ""
+    chat_id = update.effective_chat.id
+    app = context.application
+
+    try:
+        if data == "status:refresh":
+            values, updated = STATE.snapshot()
+            await query.answer("Оновлено")
+            await query.edit_message_text(format_status(values, updated), parse_mode="HTML",
+                                          reply_markup=STATUS_KB)
+            return
+
+        if data.startswith("sch:"):
+            cfg = get_cfg(app, chat_id)
+            _, kind, *rest = data.split(":", 2)
+            if kind == "t":
+                t = rest[0]
+                times = set(cfg.get("times") or [])
+                times.symmetric_difference_update({t})   # був — прибрати, не було — додати
+                cfg["times"] = sorted(times)
+                await query.answer(f"{t} {'додано' if t in times else 'прибрано'}")
+            elif kind == "i":
+                cfg["interval_min"] = int(rest[0])
+                await query.answer("Збережено")
+            elif kind == "clear":
+                cfg["times"], cfg["interval_min"] = [], 0
+                await query.answer("Розклад очищено")
+            save_schedules(app.bot_data["schedules"])
+            register_jobs(app, chat_id, cfg)
+            await query.edit_message_text(schedule_text(cfg), parse_mode="HTML", reply_markup=schedule_kb(cfg))
+            return
+
+        await query.answer()
+    except BadRequest as e:
+        # Telegram сварится, якщо текст не змінився — це не помилка
+        if "not modified" not in str(e).lower():
+            raise
 
 
 # ---------------------------------------------------------------- сповіщення
@@ -497,6 +626,8 @@ def main() -> None:
     app.add_handler(CommandHandler("clear", cmd_clear))
     app.add_handler(CommandHandler("alerts", cmd_alerts))
     app.add_handler(CommandHandler("debug", cmd_debug))
+    app.add_handler(CallbackQueryHandler(on_button))
+    app.add_handler(MessageHandler(filters.Text([BTN_STATUS, BTN_SCHEDULE, BTN_ALERTS, BTN_HELP]), on_menu_text))
     log.info("Бот запущено")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
