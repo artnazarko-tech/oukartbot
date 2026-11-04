@@ -436,7 +436,8 @@ def test_event_fanout_antispam_and_per_user_low():
         run(bot.check_alerts(ctx))
         return {cid: t for cid, t in _collect(app) if "T1" in t}
 
-    got = step(battery=100, ac_input_watts=300, output_watts=0, hardware_fault_status="Normal")
+    assert step(battery=80, ac_input_watts=300, output_watts=0, hardware_fault_status="Normal") == {}   # перше спостереження — тихо
+    got = step(battery=100)
     assert "заряджено" in got[1] and "заряджено" in got[555]                         # обидва підписані на «заряджена»
     assert step(battery=98) == {} and step(battery=100) == {}                        # цикли ДБЖ 98↔100 — без спаму
     assert step(battery=94) == {}
@@ -475,6 +476,45 @@ def test_event_fanout_antispam_and_per_user_low():
     assert "немає даних уже" in dict(_collect(app))[1] and 555 not in dict(_collect(app))
     assert "Зв'язок зі станцією відновлено" in step(battery=60)[1]
     S.set_access(555, "t1", None)
+
+
+def test_alert_state_survives_restart():
+    S.add_device("t2", "T2", "homeassistant/sensor/t2")
+    S.set_notify(1, "t2", "full", True)
+    S.set_notify(1, "t2", "low", True)
+    base = "homeassistant/sensor/t2"
+    st = bot.state_of("t2")
+    feed = lambda **kw: [st.update(f"{base}/{k}", str(v).encode(), base) for k, v in kw.items()]   # noqa: E731
+
+    def make_app(saved=None):
+        app = MagicMock(); app.bot_data = {"alert_state": bot.restore_alert_state(saved or {})}
+        app.bot.send_message = AsyncMock()
+        return app
+
+    # запуск, коли станція вже на 100%: «заряджена» не надсилається (раніше це був спам після кожного оновлення бота)
+    feed(battery=100, ac_input_watts=300, output_watts=0)
+    app = make_app()
+    run(bot.check_alerts(SimpleNamespace(application=app)))
+    assert not [t for _, t in _collect(app) if "T2" in t]
+    run(bot.check_alerts(SimpleNamespace(application=app)))                          # у тому числі при наступних циклах
+    assert not [t for _, t in _collect(app) if "T2" in t]
+    # «низький заряд» у людини — стан зберігається з числовим ключем chat_id
+    feed(battery=50)
+    run(bot.check_alerts(SimpleNamespace(application=app)))
+    saved = STORE_DATA()["alert_state"]["t2"]
+    assert saved["full"] is False and "1" in saved["low"]                            # у файлі ключ — рядок
+    app2 = make_app(saved={"t2": saved})                                             # «перезапуск»
+    assert 1 in app2.bot_data["alert_state"]["t2"]["low"]                            # відновлено як число
+    feed(battery=100)
+    run(bot.check_alerts(SimpleNamespace(application=app2)))
+    assert any("заряджено" in t for _, t in _collect(app2))                          # справжнє досягнення 100% — повідомляє
+    app3 = make_app(saved=STORE_DATA()["alert_state"])                               # ще один «перезапуск» на 100%
+    run(bot.check_alerts(SimpleNamespace(application=app3)))
+    assert not [t for _, t in _collect(app3) if "T2" in t]
+
+
+def STORE_DATA():
+    return json.loads(S.path.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

@@ -53,6 +53,7 @@ MQTT_PASSWORD = os.getenv("MQTT_PASSWORD") or None
 MQTT_TOPIC_BASE = os.getenv("MQTT_TOPIC_BASE", "homeassistant/sensor/oukitel").rstrip("/")
 
 FULL_BATTERY = float(os.getenv("ALERT_FULL_BATTERY", "100"))
+FULL_REARM_PCT = float(os.getenv("FULL_REARM_PCT", "5"))    # «Станція заряджена» знову спрацює, лише коли заряд впаде на стільки %
 GRID_MIN_W = float(os.getenv("GRID_MIN_W", "5"))      # вхід з мережі від цієї потужності точно означає «мережа є»
 GRID_DROP_PCT = float(os.getenv("GRID_DROP_PCT", "5"))  # вхід нульовий і заряд нижчий за ліміт на стільки % = світла немає
 INPUT_DEBOUNCE_S = int(os.getenv("ALERT_INPUT_DEBOUNCE_S", "60"))
@@ -1223,12 +1224,14 @@ def device_events(app: Application, dev_id: str) -> list[tuple[str, dict]]:
     if bat is not None:
         # «Станція заряджена»: спрацьовує один раз і знову «взводиться» лише після падіння до 95%
         # (або до 97% після відключення світла) — тож цикли 98→100% у режимі ДБЖ не дають спаму
+        if "full" not in st:                  # перше спостереження (після запуску): лише запам'ятовуємо, без сповіщення
+            st["full"] = bat >= FULL_BATTERY
         if bat >= FULL_BATTERY and not st.get("full"):
             events.append(("full", {"bat": bat}))
             st["full"] = True
             st["outage_since_full"] = False
-        elif st.get("full") and bat <= FULL_BATTERY - (3 if st.get("outage_since_full") else 5):
-            st["full"] = False        # після відключення світла достатньо впасти до 97%, інакше — до 95%
+        elif st.get("full") and bat <= FULL_BATTERY - (3 if st.get("outage_since_full") else FULL_REARM_PCT):
+            st["full"] = False        # після відключення світла достатньо впасти до 97%, інакше — на FULL_REARM_PCT (95%)
 
     # світло: враховуємо лише достовірні ознаки; 'idle' (заряджена й простоює) стан не змінює
     sig = grid_signal(values)
@@ -1307,6 +1310,24 @@ def low_battery_text(bat: float, level: int, values: dict) -> str:
     return f"🪫 Заряд станції знизився до <b>{bat:.0f}%</b> (поріг {level}%).{tail}"
 
 
+def restore_alert_state(saved: dict) -> dict:
+    """Стан сповіщень після перезапуску (JSON перетворює числові ключі на рядки — повертаємо назад)."""
+    state = json.loads(json.dumps(saved))
+    for st in state.values():
+        if isinstance(st.get("low"), dict):
+            st["low"] = {int(k): v for k, v in st["low"].items()}
+    return state
+
+
+def persist_alert_state(app: Application) -> None:
+    """Зберігає стан сповіщень на диск, лише якщо він змінився: після оновлення бота нічого не «забувається»."""
+    snap = json.dumps(app.bot_data.get("alert_state", {}), sort_keys=True, ensure_ascii=False)
+    if snap != app.bot_data.get("_alert_dump"):
+        app.bot_data["_alert_dump"] = snap
+        STORE.data["alert_state"] = json.loads(snap)
+        STORE.save()
+
+
 async def check_alerts(context: ContextTypes.DEFAULT_TYPE) -> None:
     app = context.application
     while ADMIN_NOTICES:                       # службові повідомлення для адмінів
@@ -1350,6 +1371,7 @@ async def check_alerts(context: ContextTypes.DEFAULT_TYPE) -> None:
                 await app.bot.send_message(chat_id, text, parse_mode="HTML")
             except Exception as e:  # noqa: BLE001
                 log.warning("Не вдалося надіслати в %s: %s", chat_id, e)
+    persist_alert_state(app)
 
 
 # ---------------------------------------------------------------- MQTT
@@ -1457,6 +1479,8 @@ async def post_init(app: Application) -> None:
     ])
     for chat_id, user in STORE.all_users():
         register_jobs(app, chat_id, user.get("schedule", {}))
+    app.bot_data["alert_state"] = restore_alert_state(STORE.data.get("alert_state", {}))
+    app.bot_data["_alert_dump"] = json.dumps(app.bot_data["alert_state"], sort_keys=True, ensure_ascii=False)
     app.job_queue.run_repeating(check_alerts, interval=15, first=30, name="alerts")
     app.job_queue.run_repeating(sync_bridge_names, interval=600, first=20, name="bridge-names")
     if STORE.data.get("ui_version") != UI_VERSION:     # меню змінилося — один раз надсилаємо всім нову клавіатуру
