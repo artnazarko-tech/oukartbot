@@ -99,7 +99,7 @@ def test_notify_defaults_and_set():
     s = fresh()
     s.add_user(2, "Мама")
     p = s.notify(2, "main")
-    assert p["low_level"] == 20 and not any(p[k] for k in ("light_on", "light_off", "full", "low", "error", "stale"))
+    assert p["low_level"] == 20 and not any(p[k] for k in ("light_on", "light_off", "full", "low", "error"))
     s.set_notify(2, "main", "light_off", True)
     s.set_notify(2, "main", "low_level", 30)
     s.set_notify(2, "mama", "full", True)                         # на іншій станції — окремо
@@ -112,6 +112,37 @@ def test_notify_defaults_and_set():
         raise AssertionError("мало бути помилкою")
     except ValueError:
         pass
+
+
+def test_epic_subscription_and_seen():
+    s = fresh()
+    s.add_user(2, "Мама"); s.add_user(3, "Тато")
+    assert not s.epic_on(2) and s.epic_subscribers() == []          # за замовчуванням вимкнено
+    s.set_epic(2, True)
+    assert s.epic_on(2) and s.epic_subscribers() == [2]
+    s.epic_mark_seen(2, "a:1"); s.epic_mark_seen(2, "b:2"); s.epic_mark_seen(2, "a:1")
+    assert s.epic_seen(2) == ["b:2", "a:1"] and s.epic_seen(3) == []
+    for i in range(60):
+        s.epic_mark_seen(2, f"k{i}")
+    assert len(s.epic_seen(2)) == 40 and s.epic_seen(2)[-1] == "k59"  # список не росте безмежно
+    s2 = Store(s.path)                                                # переживає перезапуск
+    assert s2.epic_on(2) and s2.epic_seen(2)[-1] == "k59"
+    s.set_epic(2, False)
+    assert s.epic_subscribers() == [] and s.epic_seen(2)              # вимкнули — історія лишається, повторів не буде
+    s.set_epic(999, True)                                             # невідомий користувач — тихо ігноруємо
+    assert s.epic_subscribers() == []
+
+
+def test_migrate_old_stale_notification():
+    s = fresh()
+    s.add_user(2, "Мама"); s.add_user(3, "Тато")
+    s.data["users"]["2"]["notify"] = {"main": {"stale": True, "full": True}}
+    s.data["users"]["3"]["notify"] = {"main": {"stale": False}}
+    assert s.migrate_stale_notify() is True
+    p2, p3 = s.notify(2, "main"), s.notify(3, "main")
+    assert p2["light_off"] and p2["light_on"] and p2["full"]          # хто мав «Немає даних» — отримує «Світло»
+    assert not p3["light_off"] and "stale" not in s.data["users"]["3"]["notify"]["main"]
+    assert s.migrate_stale_notify() is False                          # повторний запуск нічого не міняє
 
 
 if __name__ == "__main__":

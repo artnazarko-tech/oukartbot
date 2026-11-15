@@ -28,14 +28,16 @@ from datetime import datetime, time as dtime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import httpx
 import paho.mqtt.client as mqtt
 from dotenv import load_dotenv
-from telegram import (BotCommand, InlineKeyboardButton, InlineKeyboardMarkup,
+from telegram import (BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto,
                       KeyboardButton, ReplyKeyboardMarkup, Update)
 from telegram.error import BadRequest
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
                           ContextTypes, MessageHandler, filters)
 
+import epic
 from history import History, compute_stats
 from store import (LOW_LEVELS, NOTIFY_KEYS, SUMMARY_TIMES, ROLE_ADMIN, ROLE_GUEST, ROLE_OWNER, ROLE_TITLES, Store,
                    import_legacy_schedules)
@@ -58,9 +60,12 @@ FULL_REARM_PCT = float(os.getenv("FULL_REARM_PCT", "5"))    # «Станція �
 GRID_MIN_W = float(os.getenv("GRID_MIN_W", "5"))      # вхід з мережі від цієї потужності точно означає «мережа є»
 GRID_LOAD_W = 10.0                                    # навантаження від цієї потужності при нульовому вході = «живимось від батареї»
 GRID_DROP_PCT = float(os.getenv("GRID_DROP_PCT", "2"))  # вхід нульовий і заряд нижчий за ліміт на стільки % = світла немає (навіть без навантаження)
-GRID_OFF_DEBOUNCE_S = int(os.getenv("GRID_OFF_DEBOUNCE_S", "120"))   # скільки секунд ознаки відключення мають тривати, щоб надіслати «Світло зникло»
 INPUT_DEBOUNCE_S = int(os.getenv("ALERT_INPUT_DEBOUNCE_S", "60"))
-STALE_AFTER_S = int(os.getenv("STALE_AFTER_S", "300"))
+STALE_AFTER_S = int(os.getenv("STALE_AFTER_S", "300"))   # скільки секунд без даних від станції = «зв'язку немає» = «світла немає»
+START_TS = time.time()                                    # коли запустився бот: від цього моменту чекаємо перші дані
+EPIC_CHECK_INTERVAL_S = int(os.getenv("EPIC_CHECK_INTERVAL_S", "3600"))   # як часто дивитись, чи з'явилась нова безкоштовна гра
+EPIC_LOCALE = os.getenv("EPIC_LOCALE", "uk")              # мова опису гри
+EPIC_COUNTRY = os.getenv("EPIC_COUNTRY", "UA")            # країна (від неї залежать ціни й доступність)
 
 DATA_FILE = Path(os.getenv("DATA_FILE", "data/schedules.json"))   # старий файл (версія 1), лише для міграції
 STORE_FILE = Path(os.getenv("STORE_FILE", "data/store.json"))
@@ -70,7 +75,7 @@ DEFAULT_DEVICE_NAME = os.getenv("DEVICE_NAME", "Станція")   # тимча�
 BRIDGE_LOG_FILES = [p.strip() for p in os.getenv("BRIDGE_LOG_FILES", "/bridge/oukitel_bridge.log").split(",") if p.strip()]
 HISTORY_FILE = Path(os.getenv("HISTORY_FILE", "data/history.db"))
 CONTROL_TIMEOUT_S = int(os.getenv("CONTROL_TIMEOUT_S", "90"))   # скільки чекати підтвердження станції після команди
-UI_VERSION = 4   # при зміні меню/важливих правил бот один раз повідомляє про це всіх
+UI_VERSION = 5   # при зміні меню/важливих правил бот один раз повідомляє про це всіх
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
 log = logging.getLogger("oukitel-bot")
@@ -311,16 +316,6 @@ def work_mode(values: dict) -> str | None:
     return "живлення від батареї" if tout >= GRID_LOAD_W else "очікування"
 
 
-def grid_line(grid: tuple[bool | None, bool], short: bool = True) -> str | None:
-    present, certain = grid
-    if present is None:
-        return None
-    word = "є" if present else "немає"
-    if short:
-        return f"Мережа: {'✅' if present else '❌'} {word}" + ("" if certain else " (ймовірно)")
-    return f"Мережа: {word}" + ("" if certain else " (ймовірно: станція заряджена й нічого не живить, точно визначити неможливо)")
-
-
 def updated_line(updated: float) -> tuple[str, str]:
     ts = datetime.fromtimestamp(updated, TZ).strftime("%d.%m.%Y %H:%M:%S")
     stale = " (дані застарілі)" if time.time() - updated > STALE_AFTER_S else ""
@@ -331,15 +326,39 @@ def no_data(name: str) -> str:
     return f"⚡ <b>{name}</b>\n⏳ Даних від станції ще немає. Спробуй за хвилину."
 
 
-def format_status(values: dict, updated: float, name: str = "Станція", grid=None) -> str:
-    """Короткий стан: з картинками, для швидкого погляду."""
-    if not updated:
-        return no_data(name)
-    lines = [f"⚡ <b>{name}</b>"]
+def light_outage_since(dev_id: str, now: float | None = None) -> float | None:
+    """Світло визначаємо за зв'язком: поки станція на Wi-Fi і шле дані — світло є, пропали дані — світла немає.
+    Повертає, з якого моменту (unix) світла немає, а якщо світло є або невідомо — None."""
+    now = now or time.time()
+    _, updated = state_of(dev_id).snapshot()
+    saved = STORE.data.get("alert_state", {}).get(dev_id, {})
+    saved_since = saved.get("off_since") if saved.get("grid_on") is False else None
+    if updated and now - updated <= STALE_AFTER_S:
+        return None
+    if updated:
+        return saved_since or updated          # останні дані були тоді ж, коли зник зв'язок
+    return saved_since                         # після запуску бота даних ще не було — лишається те, що пам'ятали
 
-    gline = grid_line(grid if grid is not None else grid_status_from(values, None))
-    if gline:
-        lines.append(gline)
+
+def light_line(outage_since: float | None, short: bool = True) -> str:
+    if outage_since is None:
+        return "Світло: ✅ є" if short else "Світло: є (станція на зв'язку)"
+    began = datetime.fromtimestamp(outage_since, TZ)
+    when = began.strftime("%H:%M" if began.date() == datetime.now(TZ).date() else "%d.%m %H:%M")
+    dur = fmt_duration(time.time() - outage_since)
+    if short:
+        return f"Світло: ❌ немає вже {dur} (з {when})\n📴 Станція не виходить на зв'язок — нижче останні відомі дані"
+    return f"Світло: немає вже {dur} (з {when}); станція не виходить на зв'язок, нижче останні відомі дані"
+
+
+def format_status(values: dict, updated: float, name: str = "Станція", outage_since: float | None = None) -> str:
+    """Короткий стан: з картинками, для швидкого погляду."""
+    if not updated and outage_since is None:
+        return no_data(name)
+    lines = [f"⚡ <b>{name}</b>", light_line(outage_since)]
+    if not updated:
+        lines.append("⏳ Після запуску бота даних від станції ще не було")
+        return "\n".join(lines)
 
     bat = num(values, "battery", "battery_level", "soc")
     temp = num(values, "temperature", "temp")
@@ -379,15 +398,14 @@ def _onoff(v: str | None) -> str | None:
     return None if v is None else ("увімкнено" if v.upper() == "ON" else "вимкнено")
 
 
-def format_detail(values: dict, updated: float, name: str = "Станція", grid=None) -> str:
+def format_detail(values: dict, updated: float, name: str = "Станція", outage_since: float | None = None) -> str:
     """Детальний стан: суха інформація без картинок."""
-    if not updated:
+    if not updated and outage_since is None:
         return no_data(name)
-    L = [f"<b>{name}</b> — детальний стан", ""]
-
-    gline = grid_line(grid if grid is not None else grid_status_from(values, None), short=False)
-    if gline:
-        L.append(gline)
+    L = [f"<b>{name}</b> — детальний стан", "", light_line(outage_since, short=False)]
+    if not updated:
+        L.append("Після запуску бота даних від станції ще не було")
+        return "\n".join(L)
     mode = work_mode(values)
     if mode:
         L.append(f"Режим роботи: {mode}")
@@ -472,15 +490,13 @@ def esc(text: object) -> str:
 
 
 def status_text(dev_id: str, chat_id: int) -> str:
-    st = state_of(dev_id)
-    values, updated = st.snapshot()
-    return format_status(values, updated, esc(STORE.label(chat_id, dev_id)), st.grid_status())
+    values, updated = state_of(dev_id).snapshot()
+    return format_status(values, updated, esc(STORE.label(chat_id, dev_id)), light_outage_since(dev_id))
 
 
 def detail_text(dev_id: str, chat_id: int) -> str:
-    st = state_of(dev_id)
-    values, updated = st.snapshot()
-    return format_detail(values, updated, esc(STORE.label(chat_id, dev_id)), st.grid_status())
+    values, updated = state_of(dev_id).snapshot()
+    return format_detail(values, updated, esc(STORE.label(chat_id, dev_id)), light_outage_since(dev_id))
 
 
 def role_summary(chat_id: int, full: bool = False) -> str:
@@ -533,6 +549,7 @@ BTN_STATUS = "📊 Стан"
 BTN_CONTROL = "🎛 Керування"
 BTN_ALERTS = "🔔 Сповіщення"
 BTN_STATS = "📈 Статистика"
+BTN_EPIC = "🎮 Epic Games"
 BTN_HELP = "ℹ️ Допомога"
 BTN_USERS = "👥 Користувачі"
 BTN_SCHEDULE = "⏰ Розклад"      # стара кнопка (версія 1): лишаємо, щоб не зламати старе меню у людей
@@ -543,7 +560,7 @@ HOME = B("🏠 Головне меню", callback_data="m:main")
 
 def menu_for(chat_id: int) -> ReplyKeyboardMarkup:
     """Постійне меню внизу екрана. Адмін додатково бачить «Користувачі»."""
-    last = [KeyboardButton(BTN_HELP)]
+    last = [KeyboardButton(BTN_EPIC), KeyboardButton(BTN_HELP)]
     if STORE.is_admin(chat_id):
         last.append(KeyboardButton(BTN_USERS))
     return ReplyKeyboardMarkup(
@@ -556,9 +573,9 @@ def menu_for(chat_id: int) -> ReplyKeyboardMarkup:
 def main_menu_view(chat_id: int) -> View:
     rows = [[B(BTN_STATUS, callback_data="m:status"), B(BTN_CONTROL, callback_data="m:control")],
             [B(BTN_ALERTS, callback_data="m:alerts"), B(BTN_STATS, callback_data="m:stats")],
-            [B(BTN_HELP, callback_data="m:help")]]
+            [B(BTN_EPIC, callback_data="m:epic"), B(BTN_HELP, callback_data="m:help")]]
     if STORE.is_admin(chat_id):
-        rows[-1].append(B(BTN_USERS, callback_data="m:users"))
+        rows.append([B(BTN_USERS, callback_data="m:users")])
     return "🏠 <b>Головне меню</b>\nОбери розділ:", InlineKeyboardMarkup(rows)
 
 
@@ -596,7 +613,6 @@ NOTIFY_TITLES = {
     "light_off": "Світло зникло",
     "full": "Станція заряджена",
     "error": "Помилка станції",
-    "stale": f"Немає даних довше {STALE_AFTER_S // 60} хв",
 }
 
 
@@ -628,6 +644,8 @@ def notify_view(dev_id: str, chat_id: int) -> View:
     text = (
         f"🔔 <b>Сповіщення — {esc(STORE.label(chat_id, dev_id))}</b>\n\n"
         f"<b>Зараз увімкнено:</b>\n{current}\n\n"
+        f"Світло визначається за зв'язком: якщо станція не виходить на зв'язок {STALE_AFTER_S // 60} хв, вважаємо, що світла немає "
+        "(і навпаки). Повідомлення приходить один раз, коли стан змінився.\n\n"
         "Натисни на сповіщення, щоб увімкнути чи вимкнути його. "
         "Для заряду нижче обери поріг — коли попереджати, для підсумку дня — час."
     )
@@ -644,6 +662,98 @@ def notify_view(dev_id: str, chat_id: int) -> View:
     back = "m:alerts" if len(STORE.devices_for(chat_id)) > 1 else "m:main"
     rows.append([B("⬅️ Назад", callback_data=back), HOME])
     return text, InlineKeyboardMarkup(rows)
+
+
+# ---------------------------------------------------------------- Epic Games
+def epic_view(chat_id: int) -> View:
+    on = STORE.epic_on(chat_id)
+    text = (
+        "🎮 <b>Epic Games — безкоштовні ігри</b>\n\n"
+        "Epic Games Store щотижня роздає одну-дві гри безкоштовно. З увімкненими сповіщеннями бот сам надішле, "
+        "щойно з'явиться нова роздача: назву, короткий опис, кілька скриншотів і дату, до якої гру можна забрати.\n\n"
+        f"Сповіщення: {'✅ увімкнено' if on else '⬜ вимкнено'}"
+    )
+    kb = InlineKeyboardMarkup([
+        [B("🔕 Вимкнути сповіщення" if on else "🔔 Увімкнути сповіщення", callback_data="ep:toggle")],
+        [B("🎁 Що безкоштовно зараз", callback_data="ep:now")],
+        [HOME],
+    ])
+    return text, kb
+
+
+async def load_epic_games(with_screenshots: bool = True) -> list[epic.Game] | None:
+    """Поточні безкоштовні ігри Epic. None — не вдалося зв'язатися з Epic (це не те саме, що «роздач немає»)."""
+    try:
+        async with httpx.AsyncClient(timeout=20, headers={"User-Agent": "Mozilla/5.0"}, follow_redirects=True) as client:
+            games = await epic.fetch_free_games(client, EPIC_LOCALE, EPIC_COUNTRY)
+            if with_screenshots:
+                for game in games:
+                    await epic.load_screenshots(client, game, EPIC_LOCALE)
+        return games
+    except Exception as e:  # noqa: BLE001
+        log.warning("Не вдалося отримати роздачі Epic: %s", e)
+        return None
+
+
+async def send_epic_game(bot, chat_id: int, game: epic.Game) -> bool:
+    """Надсилає одну гру: кілька скриншотів альбомом із текстом під першим. Якщо Telegram не зміг узяти картинки — лише текст."""
+    caption = epic.format_caption(game, TZ)
+    photos = game.photos()
+    try:
+        if len(photos) >= 2:
+            await bot.send_media_group(chat_id, [
+                InputMediaPhoto(url, caption=caption if i == 0 else None, parse_mode="HTML") for i, url in enumerate(photos)])
+        elif photos:
+            await bot.send_photo(chat_id, photos[0], caption=caption, parse_mode="HTML")
+        else:
+            await bot.send_message(chat_id, caption, parse_mode="HTML")
+        return True
+    except Exception as e:  # noqa: BLE001
+        log.warning("Epic: не вдалося надіслати «%s» з картинками в %s: %s", game.title, chat_id, e)
+    try:
+        await bot.send_message(chat_id, caption, parse_mode="HTML")
+        return True
+    except Exception as e:  # noqa: BLE001
+        log.warning("Epic: не вдалося надіслати «%s» в %s: %s", game.title, chat_id, e)
+        return False
+
+
+async def send_current_epic(app: Application, chat_id: int) -> None:
+    """Показує людині ігри, які безкоштовні просто зараз (кнопка «Що безкоштовно зараз» і першe вмикання)."""
+    games = await load_epic_games()
+    if games is None:
+        await app.bot.send_message(chat_id, "⚠️ Не вдалося зв'язатися з Epic Games. Спробуй трохи пізніше.")
+        return
+    if not games:
+        await app.bot.send_message(chat_id, "Зараз Epic Games нічого безкоштовно не роздає. Я напишу, щойно з'явиться нова гра.")
+        return
+    for game in games:
+        if await send_epic_game(app.bot, chat_id, game) and STORE.epic_on(chat_id):
+            STORE.epic_mark_seen(chat_id, game.key)     # вже показали — автосповіщення не дублюватиме
+
+
+async def check_epic(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Раз на годину: чи з'явилась нова роздача. Кожна людина отримує кожну роздачу один раз."""
+    app = context.application
+    subs = STORE.epic_subscribers()
+    if not subs:
+        return
+    games = await load_epic_games(with_screenshots=False)
+    if games is None:
+        return
+    fresh = [g for g in games if any(g.key not in STORE.epic_seen(cid) for cid in subs)]
+    if not fresh:
+        return
+    try:                                         # скриншоти потрібні лише для нових ігор
+        async with httpx.AsyncClient(timeout=20, headers={"User-Agent": "Mozilla/5.0"}, follow_redirects=True) as client:
+            for game in fresh:
+                await epic.load_screenshots(client, game, EPIC_LOCALE)
+    except Exception as e:  # noqa: BLE001
+        log.warning("Epic: скриншоти недоступні: %s", e)
+    for game in fresh:
+        for cid in subs:
+            if game.key not in STORE.epic_seen(cid) and await send_epic_game(app.bot, cid, game):
+                STORE.epic_mark_seen(cid, game.key)
 
 
 # ---------------------------------------------------------------- керування
@@ -984,7 +1094,8 @@ HELP_COMMON = (
     "Нову назву бачиш тільки ти.\n\n"
     "🔔 <b>Сповіщення</b> — що бот має писати сам. Спочатку всі вимкнені: обери станцію й увімкни потрібне — "
     "світло з'явилося чи зникло (з тим, скільки світла не було), станція заряджена, заряд упав до порога "
-    "(поріг обираєш сам), помилка станції, немає даних. Налаштування окремі для кожної людини й станції. "
+    "(поріг обираєш сам), помилка станції. Світло бот визначає за зв'язком: станція на Wi-Fi і шле дані — світло є, "
+    "дані зникли на 5 хв — світла немає. Про зміну повідомляє один раз; а у «Стан», якщо зв'язку немає, показує, скільки світла немає. Налаштування окремі для кожної людини й станції. "
     "Там же «⏰ Розклад звітів»: бот сам надсилатиме стан у потрібний час або кожні кілька хвилин "
     "(свій час: /schedule 08:30).\n\n"
     "🎛 <b>Керування</b> (власник і адмін) — вмикай і вимикай виходи AC, DC і USB та обирай максимальний заряд. "
@@ -992,7 +1103,9 @@ HELP_COMMON = (
     "Якщо вимикаєш вихід із увімкненим навантаженням, бот перепитає.\n\n"
     "📈 <b>Статистика</b> — за сьогодні, 7 чи 30 днів: скільки енергії отримано й віддано, скільки було відключень світла "
     "і як довго, піковий вихід, середня тривалість зарядки. Дані бот збирає сам, тож історія з'являється поступово.\n"
-    "🌙 «Підсумок дня» — у «Сповіщення» можна увімкнути щоденне повідомлення з підсумком у зручний час."
+    "🌙 «Підсумок дня» — у «Сповіщення» можна увімкнути щоденне повідомлення з підсумком у зручний час.\n\n"
+    "🎮 <b>Epic Games</b> — окремий розділ (або /epic). Увімкни сповіщення, і бот надішле, щойно Epic Games Store почне роздавати гру безкоштовно: "
+    "назву, короткий опис, скриншоти й дату, до якої гру можна забрати. «🎁 Що безкоштовно зараз» показує поточні роздачі."
 )
 HELP_ADMIN = (
     "\n\n👥 <b>Користувачі</b> — хто має доступ і до яких станцій; тут можна змінити роль чи видалити людину.\n\n"
@@ -1011,6 +1124,12 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not allowed(update):
         return
     await reply_view(update, help_view(update.effective_chat.id))
+
+
+async def cmd_epic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not allowed(update):
+        return
+    await reply_view(update, epic_view(update.effective_chat.id))
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1362,6 +1481,8 @@ async def on_menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         view = alerts_view(chat_id)
     elif text == BTN_STATS:
         view = stats_entry_view(chat_id)
+    elif text == BTN_EPIC:
+        view = epic_view(chat_id)
     elif text == BTN_HELP:
         view = help_view(chat_id)
     elif text == BTN_SCHEDULE:
@@ -1396,6 +1517,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 "control": lambda: control_entry_view(chat_id),
                 "alerts": lambda: alerts_view(chat_id),
                 "stats": lambda: stats_entry_view(chat_id),
+                "epic": lambda: epic_view(chat_id),
                 "help": lambda: help_view(chat_id),
                 "users": users_view,
             }
@@ -1405,6 +1527,24 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             text, kb = views[name]()
             await query.answer()
             await query.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
+            return
+
+        # --- Epic Games
+        if data.startswith("ep:"):
+            action = data[3:]
+            if action == "toggle":
+                on = not STORE.epic_on(chat_id)
+                STORE.set_epic(chat_id, on)
+                await query.answer("Сповіщення увімкнено" if on else "Сповіщення вимкнено")
+                text, kb = epic_view(chat_id)
+                await query.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
+                if on:
+                    await send_current_epic(app, chat_id)      # одразу показуємо, що безкоштовно зараз
+            elif action == "now":
+                await query.answer("Шукаю…")
+                await send_current_epic(app, chat_id)
+            else:
+                await query.answer()
             return
 
         # --- стан станції (st: — короткий, sd: — детальний; status:refresh:/dev:status: — старі кнопки)
@@ -1626,19 +1766,34 @@ def device_events(app: Application, dev_id: str) -> list[tuple[str, dict]]:
     events: list[tuple[str, dict]] = []
     now = time.time()
 
-    # немає даних
-    if not updated:
-        return events
-    stale = now - updated > STALE_AFTER_S
-    if stale and not st.get("stale"):
-        events.append(("stale", {"minutes": int((now - updated) // 60)}))
-    elif not stale and st.get("stale"):
-        events.append(("stale_back", {}))
+    # Світло = зв'язок зі станцією. Пропали дані на STALE_AFTER_S — світла немає; дані повернулись — світло є.
+    # Повідомляємо лише про ЗМІНУ стану (grid_on), тому повторів не буває, поки стан не змінився.
+    last = updated or START_TS         # поки від запуску бота даних не було, відлік іде від запуску
+    stale = now - last > STALE_AFTER_S
+    bat = num(values, "battery", "battery_level", "soc")       # останній відомий заряд
+    if "grid_on" not in st:             # перше спостереження: лише запам'ятовуємо, без повідомлення
+        st["grid_on"] = not stale
+        if stale:
+            st["off_since"] = last
+    elif st["grid_on"] and stale:
+        st["grid_on"] = False
+        st["off_since"] = last
+        st.pop("back_since", None)
+        st["outage_since_full"] = True      # було відключення: «заряджена» знову спрацює вже після спаду до 97%
+        events.append(("light_off", {"bat": bat, "began": last}))
+    elif not st["grid_on"] and not stale:
+        since = st.setdefault("back_since", now)
+        if now - since >= INPUT_DEBOUNCE_S:            # зв'язок має триматися хвилину, інакше це «блимання» Wi-Fi
+            began = st.pop("off_since", None)
+            st["grid_on"] = True
+            st.pop("back_since", None)
+            events.append(("light_on", {"bat": bat, "outage_s": now - began if began else None, "began": since}))
+    elif not st["grid_on"]:
+        st.pop("back_since", None)                     # зв'язок знову зник до закінчення хвилини
     st["stale"] = stale
     if stale:
         return events
 
-    bat = num(values, "battery", "battery_level", "soc")
     if bat is not None:
         # «Станція заряджена»: спрацьовує один раз і знову «взводиться» лише після падіння до 95%
         # (або до 97% після відключення світла) — тож цикли 98→100% у режимі ДБЖ не дають спаму
@@ -1650,37 +1805,6 @@ def device_events(app: Application, dev_id: str) -> list[tuple[str, dict]]:
             st["outage_since_full"] = False
         elif st.get("full") and bat <= FULL_BATTERY - (3 if st.get("outage_since_full") else FULL_REARM_PCT):
             st["full"] = False        # після відключення світла достатньо впасти до 97%, інакше — на FULL_REARM_PCT (95%)
-
-    # світло: враховуємо лише достовірні ознаки; 'idle' (заряджена й простоює) стан не змінює
-    sig = grid_signal(values)
-    if sig == "idle" and "grid_on" not in st:
-        st["grid_on"] = True                  # повна батарея без навантаження — вважаємо, що мережа є
-    if sig in ("on", "off"):
-        on = sig == "on"
-        if "grid_on" not in st:
-            st["grid_on"] = on
-        elif on != st["grid_on"]:
-            since = st.setdefault("grid_change_since", now)
-            if now - since >= (INPUT_DEBOUNCE_S if on else GRID_OFF_DEBOUNCE_S):   # затримка проти коротких провалів
-                st["grid_on"] = on
-                st.pop("grid_change_since", None)
-                tout = num(values, "output_watts", "total_output_power", "output_power")
-                remain = num(values, "remain_time", "remaining_discharge_time")
-                log.info("Світло %s на %s: заряд=%s вхід(AC)=%s вхід(усього)=%s вихід=%s ліміт=%s", "з'явилося" if on else "зникло",
-                         dev_id, bat, num(values, "ac_input_watts"), num(values, "input_watts"), tout,
-                         num(values, "ac_charging_limit"))
-                if on:
-                    began = st.pop("off_since", None)
-                    events.append(("light_on", {"bat": bat, "outage_s": now - began if began else None, "began": since}))
-                else:
-                    st["off_since"] = since
-                    st["outage_since_full"] = True     # було відключення: «заряджена» знову спрацює вже після спаду до 97%
-                    left = fmt_minutes(remain) if tout and tout > 0 and remain else None
-                    events.append(("light_off", {"bat": bat, "left": left if left != "—" else None, "began": since}))
-        else:
-            st.pop("grid_change_since", None)
-    elif sig == "idle":
-        st.pop("grid_change_since", None)         # простій перериває «відлік» зміни стану
 
     # помилки
     fault = fault_list(values)
@@ -1695,28 +1819,26 @@ def device_events(app: Application, dev_id: str) -> list[tuple[str, dict]]:
 
 
 # яка подія керується яким перемикачем у налаштуваннях людини
-EVENT_SETTING = {"stale_back": "stale", "error_clear": "error"}
+EVENT_SETTING = {"error_clear": "error"}
 
 
 def render_event(kind: str, d: dict) -> str:
     ts = datetime.now(TZ).strftime("%H:%M")
+    if kind == "light_off" and d.get("began"):
+        ts = datetime.fromtimestamp(d["began"], TZ).strftime("%H:%M")     # коли зв'язок реально пропав, а не коли це помітили
     bat = f" Заряд: {d['bat']:.0f}%." if d.get("bat") is not None else ""
     if kind == "light_on":
         out = f" Світла не було {fmt_duration(d['outage_s'])}." if d.get("outage_s") and d["outage_s"] >= 60 else ""
         return f"💡 Світло з'явилося о {ts}.{out}{bat}"
     if kind == "light_off":
-        left = f" Вистачить приблизно на {d['left']}." if d.get("left") else ""
-        return f"🔌 Світло зникло о {ts}. Працюємо від батареї.{bat}{left}"
+        last = f" Останній відомий заряд: {d['bat']:.0f}%." if d.get("bat") is not None else ""
+        return f"🔌 Світло зникло о {ts}: станція втратила зв'язок.{last}"
     if kind == "full":
         return f"🔋 Станцію заряджено: <b>{d['bat']:.0f}%</b>"
     if kind == "error":
         return f"⚠️ Помилка станції: <b>{esc(d['text'])}</b>"
     if kind == "error_clear":
         return "✅ Помилку усунуто"
-    if kind == "stale":
-        return f"📡 Від станції немає даних уже {d['minutes']} хв"
-    if kind == "stale_back":
-        return "📡 Зв'язок зі станцією відновлено"
     raise ValueError(kind)
 
 
@@ -1879,6 +2001,8 @@ def bootstrap_store() -> Store:
     if first_run:
         n = import_legacy_schedules(store, load_legacy_schedules(), DEFAULT_DEVICE_ID)
         log.info("Створено %s, перенесено розкладів зі старого файлу: %s", STORE_FILE, n)
+    if store.migrate_stale_notify():
+        log.info("Старе сповіщення «Немає даних» перенесено в «Світло зникло / з'явилося»")
     for chat_id in ALLOWED_CHAT_IDS:
         store.ensure_admin(chat_id)
     if not any(u.get("admin") for _, u in store.all_users()):
@@ -1899,6 +2023,7 @@ async def post_init(app: Application) -> None:
         BotCommand("alerts", "Автоматичні сповіщення"),
         BotCommand("control", "Керування станцією"),
         BotCommand("stats", "Статистика"),
+        BotCommand("epic", "Безкоштовні ігри Epic Games"),
         BotCommand("invite", "Запросити людину (адмін)"),
         BotCommand("users", "Користувачі (адмін)"),
         BotCommand("debug", "Сирі дані MQTT (адмін)"),
@@ -1909,6 +2034,7 @@ async def post_init(app: Application) -> None:
     app.bot_data["_alert_dump"] = json.dumps(app.bot_data["alert_state"], sort_keys=True, ensure_ascii=False)
     app.job_queue.run_repeating(check_alerts, interval=15, first=30, name="alerts")
     app.job_queue.run_repeating(sync_bridge_names, interval=600, first=20, name="bridge-names")
+    app.job_queue.run_repeating(check_epic, interval=EPIC_CHECK_INTERVAL_S, first=60, name="epic")
     app.job_queue.run_repeating(check_pending, interval=2, first=5, name="control-pending")
     app.job_queue.run_repeating(sample_history, interval=30, first=15, name="history-sample")
     app.job_queue.run_repeating(send_summaries, interval=30, first=40, name="daily-summary")
@@ -1916,9 +2042,9 @@ async def post_init(app: Application) -> None:
     if STORE.data.get("ui_version") != UI_VERSION:     # меню змінилося — один раз надсилаємо всім нову клавіатуру
         for chat_id, _ in STORE.all_users():
             try:
-                await app.bot.send_message(chat_id, "🔄 Бот оновився: тепер працюють «🎛 Керування» (виходи AC/DC/USB і максимальний заряд — для власників) "
-                                           "та «📈 Статистика». У «🔔 Сповіщення» з'явився щоденний підсумок дня. "
-                                           "Інструкція — /help",
+                await app.bot.send_message(chat_id, "🔄 Бот оновився: світло тепер визначається за зв'язком зі станцією (пропав зв'язок на 5 хв — світла немає), "
+                                           "а у «Стан» видно, скільки світла немає. З'явилась кнопка «🎮 Epic Games» — "
+                                           "сповіщення про безкоштовні ігри. Інструкція — /help",
                                            reply_markup=menu_for(chat_id))
             except Exception as e:  # noqa: BLE001
                 log.warning("Не вдалося оновити меню в %s: %s", chat_id, e)
@@ -1942,6 +2068,7 @@ def main() -> None:
     app.add_handler(CommandHandler("alerts", cmd_alerts))
     app.add_handler(CommandHandler("control", cmd_control))
     app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CommandHandler("epic", cmd_epic))
     app.add_handler(CommandHandler("rename", cmd_rename))
     app.add_handler(CommandHandler("devname", cmd_devname))
     app.add_handler(CommandHandler("invite", cmd_invite))
@@ -1949,7 +2076,7 @@ def main() -> None:
     app.add_handler(CommandHandler("debug", cmd_debug))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(
-        filters.Text([BTN_STATUS, BTN_CONTROL, BTN_ALERTS, BTN_STATS, BTN_SCHEDULE, BTN_HELP, BTN_USERS]), on_menu_text))
+        filters.Text([BTN_STATUS, BTN_CONTROL, BTN_ALERTS, BTN_STATS, BTN_SCHEDULE, BTN_EPIC, BTN_HELP, BTN_USERS]), on_menu_text))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     log.info("Бот запущено")
     app.run_polling(allowed_updates=Update.ALL_TYPES)

@@ -61,7 +61,7 @@ def test_status_and_denied():
     bot.state_of("main").update(f"{bot.MQTT_TOPIC_BASE}/ac_input_watts", b"450", bot.MQTT_TOPIC_BASE)
     upd, ctx = make_update(1, "📊 Стан")
     run(bot.on_menu_text(upd, ctx))
-    assert "87%" in said(upd) and "Мережа: ✅ є" in said(upd)
+    assert "87%" in said(upd) and "Світло: ✅ є" in said(upd)
     upd, ctx = make_update(999, args=[])               # чужой
     run(bot.cmd_start(upd, ctx))
     assert "Доступ лише за запрошенням" in said(upd)
@@ -253,13 +253,13 @@ def test_status_and_detail_format():
          "typec1_power": 0, "usb_a_power": 5, "dc_output_voltage": 0.0, "dc_output_current": 0.0}
     t = bot.format_status(v, time.time(), "Дача")
     lines = t.split("\n")
-    assert lines[0] == "⚡ <b>Дача</b>" and lines[1] == "Мережа: ✅ є"
+    assert lines[0] == "⚡ <b>Дача</b>" and lines[1] == "Світло: ✅ є"
     assert "87%" in lines[2] and "31 °C" in lines[2]
     assert "Вхід: <b>450 Вт</b>" in lines[3] and "Вихід: <b>120 Вт</b>" in lines[3]
     assert "Помилки: ✅ немає" in t and re.search(r"Оновлено: \d\d\.\d\d\.\d{4} \d\d:\d\d", t)
     bad = dict(v, ac_input_watts=0, input_watts=0, hardware_fault_status="Overload Protection", availability="offline")
-    t2 = bot.format_status(bad, time.time() - 1000, "Дача")
-    assert "Мережа: ❌ немає" in t2 and "Помилки: 1" in t2 and "⚠️ Спрацював захист" in t2
+    t2 = bot.format_status(bad, time.time() - 1000, "Дача", outage_since=time.time() - 1000)
+    assert "Світло: ❌ немає вже 16 хв" in t2 and "нижче останні відомі дані" in t2 and "Помилки: 1" in t2 and "⚠️ Спрацював захист" in t2
     assert "не на зв'язку" in t2 and "застарілі" in t2
     d = bot.format_detail(v, time.time(), "Дача")
     assert "детальний стан" in d and "50 Гц" in d and "Ліміт зарядки з мережі: 100%" in d
@@ -274,7 +274,7 @@ def test_status_and_detail_format():
     assert wm({"ac_input_watts": 0, "input_watts": 0, "output_watts": 0}) == "очікування" and wm({}) is None
     off = {"battery": 97, "input_watts": 0, "ac_input_watts": 0, "output_watts": 215, "remain_time": 300}
     assert "Режим роботи: живлення від батареї" in bot.format_detail(off, time.time(), "Д")
-    assert "Мережа: ❌ немає" in bot.format_status(off, time.time(), "Д")
+    assert "Світло: ✅ є" in bot.format_status(off, time.time(), "Д")      # світло — за зв'язком, а не за потужністю
 
 
 def test_menu_navigation():
@@ -283,7 +283,7 @@ def test_menu_navigation():
     assert "👥 Користувачі" not in [b.text for row in bot.menu_for(555).keyboard for b in row]
     for data, expect in (("m:main", "Головне меню"), ("m:control", "Керування"), ("m:stats", "Статистика"),
                          ("m:alerts", "Сповіщення"), ("sch:open", "Розклад звітів"), ("m:help", "Інструкція"),
-                         ("m:users", "Користувачі"), ("sd:main", "детальний стан"), ("st:main", "Мережа")):
+                         ("m:users", "Користувачі"), ("sd:main", "детальний стан"), ("st:main", "Світло")):
         upd, ctx = make_update(1, data=data)
         run(bot.on_button(upd, ctx))
         assert expect in edited(upd), data
@@ -367,30 +367,60 @@ def test_grid_detection_without_input_power():
     assert st.grid_status() == (False, True)
 
 
-def test_grid_text_and_alerts_with_idle():
-    idle = {"battery": 100, "temperature": 29, "input_watts": 0, "ac_input_watts": 0, "output_watts": 0,
-            "hardware_fault_status": "Normal"}
-    assert "Мережа: ✅ є (ймовірно)" in bot.format_status(idle, time.time(), "X")
-    assert "ймовірно" in bot.format_detail(idle, time.time(), "X")
-    assert "Мережа: ✅ є\n" in bot.format_status(dict(idle, ac_input_watts=30), time.time(), "X")
-    # сповіщення: простій не вважається відключенням
-    bot.INPUT_DEBOUNCE_S = 0; bot.GRID_OFF_DEBOUNCE_S = 0
+def test_light_by_connection():
+    """Світло = зв'язок зі станцією: даних немає >5 хв — світла немає; повідомлення лише при зміні стану."""
+    bot.INPUT_DEBOUNCE_S = 60
     app = MagicMock(); app.bot_data = {}
     st = bot.state_of("dacha"); st.values = {}; st.updated = 0
     base = "homeassistant/sensor/oukitel_dacha"
     def feed(**kw):
         for k, v in kw.items():
             st.update(f"{base}/{k}", str(v).encode(), base)
-    kinds = lambda: [k for k, _ in bot.device_events(app, "dacha")]            # noqa: E731
-    feed(battery=100, ac_input_watts=0, output_watts=0)
-    assert not {"light_on", "light_off"} & set(kinds())                              # простій: тихо
-    assert app.bot_data["alert_state"]["dacha"]["grid_on"] is True                   # базова лінія: мережа є
-    feed(output_watts=60)                                                            # навантаження є, входу немає — живимось від батареї
-    assert "light_off" in kinds()
-    feed(output_watts=0)                                                             # знову простій — повторів нема
-    assert not {"light_on", "light_off"} & set(kinds())
-    feed(ac_input_watts=200)
-    assert "light_on" in kinds()
+    ev = lambda: bot.device_events(app, "dacha")                                    # noqa: E731
+    kinds = lambda: [k for k, _ in ev()]                                            # noqa: E731
+
+    assert kinds() == []                                                            # даних ще не було: від запуску бота < 5 хв — тихо
+    assert bot.light_outage_since("dacha") is None
+    assert "ще немає" in bot.format_status({}, 0, "Д")
+    feed(battery=80, ac_input_watts=0, output_watts=0)                              # станція заряджена, нічого не споживає — це НЕ відключення
+    assert kinds() == [] and app.bot_data["alert_state"]["dacha"]["grid_on"] is True
+
+    st.updated = time.time() - 400                                                  # зв'язок зник 6+ хв тому
+    got = ev()
+    assert [k for k, _ in got] == ["light_off"]
+    began = got[0][1]["began"]
+    assert abs(began - st.updated) < 1 and got[0][1]["bat"] == 80
+    assert kinds() == [] and kinds() == []                                          # стан не змінився — повідомлень більше нема
+    since = bot.light_outage_since("dacha")
+    assert abs(since - st.updated) < 1                                              # у «Стан» видно, відколи світла немає
+    text = bot.status_text("dacha", 1)
+    assert "Світло: ❌ немає вже 6 хв" in text and "80%" in text                    # + останні відомі дані
+    assert "Світло: немає вже 6 хв" in bot.detail_text("dacha", 1)
+    st.updated = time.time() - 4000                                                 # довше за годину
+    assert "немає вже 1 год 06 хв" in bot.status_text("dacha", 1)
+
+    feed(battery=79)                                                                # зв'язок відновився
+    assert kinds() == []                                                            # одразу не повідомляємо: чекаємо хвилину
+    assert "Світло: ✅ є" in bot.status_text("dacha", 1)                            # але в «Стан» вже видно, що зв'язок є
+    st.updated = time.time() - 400                                                  # «блимання» Wi-Fi: знову зник
+    assert kinds() == [] and "back_since" not in app.bot_data["alert_state"]["dacha"]
+    feed(battery=79)
+    assert kinds() == []
+    app.bot_data["alert_state"]["dacha"]["back_since"] = time.time() - 61           # зв'язок тримається хвилину
+    app.bot_data["alert_state"]["dacha"]["off_since"] = time.time() - 5400
+    got = ev()
+    assert [k for k, _ in got] == ["light_on"] and 5390 < got[0][1]["outage_s"] < 5410
+    assert bot.render_event("light_on", got[0][1]).count("1 год 30 хв") == 1
+    assert "станція втратила зв'язок" in bot.render_event("light_off", {"began": time.time(), "bat": 80})
+    assert kinds() == []
+
+    # перезапуск бота під час відключення: стан пам'ятається, після повернення зв'язку — «світло з'явилося» з тривалістю
+    saved = {"dacha": {"grid_on": False, "off_since": time.time() - 3600}}
+    S.data["alert_state"] = saved
+    st.updated = 0
+    assert abs(bot.light_outage_since("dacha") - saved["dacha"]["off_since"]) < 1
+    assert "Світло: ❌ немає вже 1 год 00 хв" in bot.status_text("dacha", 1) and "не було" in bot.status_text("dacha", 1)
+    S.data["alert_state"] = {}
 
 
 def _collect(app):
@@ -426,12 +456,12 @@ def test_notification_settings_screens():
 def test_event_fanout_antispam_and_per_user_low():
     S.add_device("t1", "T1", "homeassistant/sensor/t1")
     S.set_access(555, "t1", "guest")
-    for k in ("light_on", "light_off", "full", "error", "stale", "low"):
+    for k in ("light_on", "light_off", "full", "error", "low"):
         S.set_notify(1, "t1", k, True)
     S.set_notify(555, "t1", "full", True)
     S.set_notify(555, "t1", "low", True); S.set_notify(555, "t1", "low_level", 15)
     S.set_notify(1, "t1", "low_level", 30)
-    bot.INPUT_DEBOUNCE_S = 0; bot.GRID_OFF_DEBOUNCE_S = 0
+    bot.INPUT_DEBOUNCE_S = 0
     app = MagicMock(); app.bot_data = {}; app.bot.send_message = AsyncMock()
     ctx = SimpleNamespace(application=app)
     base = "homeassistant/sensor/t1"
@@ -451,12 +481,16 @@ def test_event_fanout_antispam_and_per_user_low():
     assert step(battery=94) == {}
     assert "заряджено" in step(battery=100)[1]                                       # впала до 94% → знову взведено
 
-    # відключення світла: 555 про нього не просив
-    got = step(ac_input_watts=0, output_watts=100, remain_time=380)                  # навантаження є, входу немає
-    assert "Світло зникло" in got[1] and "6 год 20 хв" in got[1] and 555 not in got
-    assert step(battery=99) == {} and step(battery=96) == {}                         # після відключення «заряджена» взводиться на 97%
+    # відключення світла (зв'язок зник): 555 про нього не просив
+    app.bot.send_message.reset_mock()
+    st.updated = time.time() - 400
+    run(bot.check_alerts(ctx))
+    got = {cid: t for cid, t in _collect(app) if "T1" in t}
+    assert "Світло зникло" in got[1] and "втратила зв'язок" in got[1] and 555 not in got
+    app.bot.send_message.reset_mock(); run(bot.check_alerts(ctx))
+    assert not [t for _, t in _collect(app) if "T1" in t]                            # без повторів, поки стан не змінився
     app.bot_data["alert_state"]["t1"]["off_since"] = time.time() - 8100
-    got = step(ac_input_watts=200, output_watts=0)
+    got = step(battery=96)                                                           # зв'язок повернувся (після відключення «заряджена» взводиться на 97%)
     assert "Світло з'явилося" in got[1] and "Світла не було 2 год 15 хв" in got[1]
     assert "заряджено" not in step(battery=99).get(1, "")
     assert "заряджено" in step(battery=100)[1]                                       # знову заряджена — сповіщення є
@@ -477,11 +511,6 @@ def test_event_fanout_antispam_and_per_user_low():
     assert step(battery=36) == {}                                                    # адмін знову «взведений» (≥35)
     assert "знизився до <b>29%" in step(battery=29)[1]
 
-    # немає даних
-    st.updated = time.time() - 1000
-    app.bot.send_message.reset_mock(); run(bot.check_alerts(ctx))
-    assert "немає даних уже" in dict(_collect(app))[1] and 555 not in dict(_collect(app))
-    assert "Зв'язок зі станцією відновлено" in step(battery=60)[1]
     S.set_access(555, "t1", None)
 
 
@@ -671,6 +700,102 @@ def test_sampler_and_events_to_history():
     assert len(rows) == 1 and rows[0][1:4] == (77.0, 300.0, 100.0) and rows[0][4] == 1
     bot.HISTORY = None
     run(bot.sample_history(None))                     # без історії — тихо нічого не робить
+
+
+def _epic_games():
+    import epic
+    now = datetime.now(bot.TZ).astimezone(epic.timezone.utc)
+    g1 = epic.Game("g1", "Гра Один", "Опис гри один", now - timedelta(days=1), now + timedelta(days=5),
+                   url="https://store.epicgames.com/uk/p/one", price="₴100", cover="https://cdn/c1.jpg", slug="one")
+    g1.screenshots = ["https://cdn/s1.jpg", "https://cdn/s2.jpg", "https://cdn/s3.jpg"]
+    g2 = epic.Game("g2", "Гра Два", "Опис гри два", now - timedelta(days=1), now + timedelta(days=5), cover="https://cdn/c2.jpg")
+    return g1, g2
+
+
+def test_epic_menu_toggle_and_instant_games():
+    S.add_user(77, "Epic")
+    upd, ctx = make_update(77, "🎮 Epic Games")
+    run(bot.on_menu_text(upd, ctx))
+    assert "Epic Games — безкоштовні ігри" in said(upd) and "⬜ вимкнено" in said(upd)
+    assert any("Epic" in b.text for row in bot.menu_for(77).keyboard for b in row)                       # кнопка в нижньому меню
+    assert any(b.callback_data == "m:epic" for row in bot.main_menu_view(77)[1].inline_keyboard for b in row)   # і в головному
+    games = _epic_games()
+
+    async def fake_load(with_screenshots=True):
+        return list(games)
+    bot.load_epic_games = fake_load
+    app = MagicMock(); app.bot = SimpleNamespace(send_media_group=AsyncMock(), send_photo=AsyncMock(), send_message=AsyncMock())
+    upd, ctx = make_update(77, data="ep:toggle"); ctx.application = app
+    run(bot.on_button(upd, ctx))
+    assert S.epic_on(77) and "✅ увімкнено" in edited(upd)
+    media = app.bot.send_media_group.call_args[0]
+    assert media[0] == 77 and len(media[1]) == 3 and media[1][0].caption.startswith("🎮 <b>Гра Один</b>") and media[1][1].caption is None
+    assert app.bot.send_photo.call_args[0][:2] == (77, "https://cdn/c2.jpg")            # скриншотів нема — обкладинка
+    assert S.epic_seen(77) == [g.key for g in games]                                      # показані одразу — автосповіщення не дублює
+    upd, ctx = make_update(77, data="ep:toggle"); ctx.application = app
+    run(bot.on_button(upd, ctx))
+    assert not S.epic_on(77) and "⬜ вимкнено" in edited(upd)
+
+
+def test_epic_hourly_check_no_duplicates_and_failures():
+    games = list(_epic_games())
+    S.add_user(78, "A"); S.add_user(79, "B")
+    S.set_epic(78, True)
+    calls = {"n": 0}
+
+    async def fake_load(with_screenshots=True):
+        calls["n"] += 1
+        return None if calls["n"] == 1 else list(games)
+    bot.load_epic_games = fake_load
+
+    class FakeClient:                                                         # скриншоти в цьому тесті не тягнемо з мережі
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+    bot.httpx.AsyncClient = lambda **kw: FakeClient()
+    import epic
+    async def no_shots(client, game, locale="uk"): return None
+    epic.load_screenshots = no_shots
+
+    app = MagicMock(); app.bot = SimpleNamespace(send_media_group=AsyncMock(), send_photo=AsyncMock(), send_message=AsyncMock())
+    ctx = SimpleNamespace(application=app)
+    run(bot.check_epic(ctx))                                                  # Epic недоступний — тихо, нічого не позначено
+    sent = lambda: app.bot.send_photo.call_count + app.bot.send_media_group.call_count      # noqa: E731
+    assert sent() == 0 and S.epic_seen(78) == []
+    run(bot.check_epic(ctx))                                                  # з'явились дві гри: перша зі скриншотами (альбом), друга з обкладинкою
+    assert app.bot.send_media_group.call_count == 1 and app.bot.send_photo.call_count == 1
+    assert S.epic_seen(78) == [g.key for g in games]
+    run(bot.check_epic(ctx))                                                  # третій раз: нічого нового — без повторів
+    assert sent() == 2
+    assert S.epic_seen(79) == []                                              # підписаний лише 78
+    # той самий ключ, але нова роздача (інша дата завершення) — повідомлення знову
+    g3 = _epic_games()[1]; g3.end += timedelta(days=30)
+    games[:] = [g3]
+    run(bot.check_epic(ctx))
+    assert sent() == 3
+
+
+def test_epic_falls_back_to_text_when_telegram_rejects_images():
+    g1, g2 = _epic_games()
+    bot_ = SimpleNamespace(send_media_group=AsyncMock(side_effect=RuntimeError("wrong file identifier/HTTP URL")),
+                           send_photo=AsyncMock(side_effect=RuntimeError("bad url")), send_message=AsyncMock())
+    assert run(bot.send_epic_game(bot_, 5, g1)) is True and bot_.send_message.call_count == 1
+    assert run(bot.send_epic_game(bot_, 5, g2)) is True and bot_.send_message.call_count == 2
+    assert "Гра Два" in bot_.send_message.call_args[0][1]
+    dead = SimpleNamespace(send_media_group=AsyncMock(side_effect=RuntimeError("x")), send_photo=AsyncMock(side_effect=RuntimeError("x")),
+                           send_message=AsyncMock(side_effect=RuntimeError("blocked")))
+    assert run(bot.send_epic_game(dead, 5, g1)) is False                       # не вдалося зовсім — гру не позначають «баченою»
+
+
+def test_epic_now_button_messages():
+    app = MagicMock(); app.bot = SimpleNamespace(send_media_group=AsyncMock(), send_photo=AsyncMock(), send_message=AsyncMock())
+    async def none_load(with_screenshots=True): return None
+    async def empty_load(with_screenshots=True): return []
+    bot.load_epic_games = none_load
+    run(bot.send_current_epic(app, 1))
+    assert "Не вдалося зв'язатися з Epic" in app.bot.send_message.call_args[0][1]
+    bot.load_epic_games = empty_load
+    run(bot.send_current_epic(app, 1))
+    assert "нічого безкоштовно не роздає" in app.bot.send_message.call_args[0][1]
 
 
 def STORE_DATA():

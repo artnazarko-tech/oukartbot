@@ -26,7 +26,7 @@ ROLE_TITLES = {ROLE_ADMIN: "Адмін", ROLE_OWNER: "Власник", ROLE_GUES
 INVITE_TTL_S = 48 * 3600
 
 # Сповіщення, які людина може вмикати окремо для кожної станції (за замовчуванням ВСІ вимкнені)
-NOTIFY_KEYS = ("light_on", "light_off", "full", "low", "error", "stale", "summary")
+NOTIFY_KEYS = ("light_on", "light_off", "full", "low", "error", "summary")
 DEFAULT_LOW_LEVEL = 20
 LOW_LEVELS = (10, 15, 20, 30, 40, 50)
 DEFAULT_SUMMARY_TIME = "21:00"
@@ -270,6 +270,51 @@ class Store:
             if user is not None:
                 user.setdefault("notify", {}).setdefault(dev_id, {})["summary_last"] = day
                 self.save()
+
+    # ------------------------------------------------------------ Epic Games
+    def epic_on(self, chat_id: int) -> bool:
+        """Чи увімкнені в людини сповіщення про безкоштовні ігри Epic (за замовчуванням — ні)."""
+        return bool(((self.get_user(chat_id) or {}).get("epic") or {}).get("on"))
+
+    def set_epic(self, chat_id: int, on: bool) -> None:
+        with self._lock:
+            user = self.get_user(chat_id)
+            if user is not None:
+                user.setdefault("epic", {})["on"] = bool(on)
+                self.save()
+
+    def epic_subscribers(self) -> list[int]:
+        with self._lock:
+            return [int(cid) for cid, u in self.data["users"].items() if (u.get("epic") or {}).get("on")]
+
+    def epic_seen(self, chat_id: int) -> list[str]:
+        """Ключі ігор, про які людині вже повідомили (щоб не надсилати двічі)."""
+        return list(((self.get_user(chat_id) or {}).get("epic") or {}).get("seen") or [])
+
+    def epic_mark_seen(self, chat_id: int, key: str, keep: int = 40) -> None:
+        with self._lock:
+            user = self.get_user(chat_id)
+            if user is None:
+                return
+            epic = user.setdefault("epic", {})
+            seen = [k for k in epic.get("seen", []) if k != key] + [key]
+            epic["seen"] = seen[-keep:]
+            self.save()
+
+    def migrate_stale_notify(self) -> bool:
+        """Раніше була окрема «Немає даних 5 хв». Тепер це і є «Світло зникло / з'явилося»:
+        хто мав увімкнене старе сповіщення — отримує нові, а старий ключ прибираємо."""
+        changed = False
+        with self._lock:
+            for user in self.data["users"].values():
+                for prefs in (user.get("notify") or {}).values():
+                    if "stale" in prefs:
+                        if prefs.pop("stale"):
+                            prefs["light_off"] = prefs["light_on"] = True
+                        changed = True
+            if changed:
+                self.save()
+        return changed
 
     # ------------------------------------------------------------ запрошення
     def create_invite(self, role: str, devices: list[str], created_by: int, ttl: int = INVITE_TTL_S) -> str:
